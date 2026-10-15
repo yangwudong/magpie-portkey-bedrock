@@ -174,43 +174,7 @@ test("missing key, malformed tool JSON, truncated stream and provider errors fai
   assert.match(failed.message.errorMessage!, /context_length_exceeded/);
 });
 
-test("environment variables fill in unset routing values, file values win", () => {
-  const temp = mkdtempSync(join(tmpdir(), "portkey-env-"));
-  const path = join(temp, "config.json");
-  const models = join(temp, "models.json");
-  writeFileSync(models, '["model-1"]');
-  const previous = { ...process.env };
-  process.env.PORTKEY_BASE_URL = "https://env.example/v1";
-  process.env.PORTKEY_PROVIDER = "@env-route";
-  process.env.PORTKEY_CONFIG_ID = "env-cfg";
-  try {
-    writeFileSync(path, JSON.stringify({}));
-    let config = readConfig(path, models);
-    assert.equal(config.baseUrl, "https://env.example/v1");
-    assert.equal(config.provider, "@env-route");
-    assert.equal(config.configId, "env-cfg");
-    assert.equal(config.headers["x-portkey-provider"], "@env-route");
-    assert.equal(config.headers["x-portkey-config"], "env-cfg");
-
-    writeFileSync(path, JSON.stringify({ baseUrl: "https://file.example", provider: "@file-route" }));
-    config = readConfig(path, models);
-    assert.equal(config.baseUrl, "https://file.example");
-    assert.equal(config.provider, "@file-route");
-    assert.equal(config.configId, "env-cfg");
-
-    delete process.env.PORTKEY_BASE_URL;
-    writeFileSync(path, JSON.stringify({}));
-    assert.throws(() => readConfig(path, models), /PORTKEY_BASE_URL/);
-  } finally {
-    process.env = previous;
-    rmSync(temp, { recursive: true });
-  }
-});
-
-test("configuration matches pi's catalog and rejects embedded secrets", () => {
-  const config = readConfig();
-  assert.equal(config.models.length, 15);
-  assert.equal(config.headers["x-portkey-provider"], config.provider);
+test("rejects secrets embedded in the config", () => {
   const temp = mkdtempSync(join(tmpdir(), "portkey-config-"));
   try {
     const path = join(temp, "config.json");
@@ -220,14 +184,11 @@ test("configuration matches pi's catalog and rejects embedded secrets", () => {
     assert.throws(() => readConfig(path, models), /secret/);
     writeFileSync(path, JSON.stringify({ baseUrl: "https://example.com", headers: { Authorization: "secret" } }));
     assert.throws(() => readConfig(path, models), /secret/);
-    writeFileSync(path, JSON.stringify({ baseUrl: "https://example.com", apiKeyEnv: "BAD-NAME" }));
-    assert.throws(() => readConfig(path, models), /environment variable/);
   } finally { rmSync(temp, { recursive: true }); }
   let registered: any;
   plugin({ registerProvider: (id: string, options: unknown) => { registered = { id, options }; } } as any);
   assert.equal(registered.id, "portkey-bedrock");
   assert.equal(registered.options.models.length, 15);
-  assert.equal(registered.options.apiKey, `$${config.apiKeyEnv}`);
   // The catalog ends with the non-Anthropic extras; check a known entry's shape.
   const nova = registered.options.models.find((m: any) => m.id === "amazon.nova-pro-v1:0");
   assert.equal(nova.maxTokens, 6400);
@@ -285,12 +246,25 @@ test("model discovery fails closed and keeps the catalog", async () => {
   });
   assert.equal(offline.length, config.models.length);
 
-  for (const body of [new Response("nope", { status: 404 }), new Response(JSON.stringify({ data: [] }), { status: 200 })]) {
-    await assert.rejects(
-      () => discoverGatewayModels(config, discoveryContext() as any, async () => body.clone() as any),
-      /portkey-bedrock/,
+  // Gateways that refuse to list models (403/404) keep the catalog quietly.
+  for (const status of [403, 404]) {
+    const kept = await discoverGatewayModels(
+      config,
+      discoveryContext() as any,
+      async () => new Response("denied", { status }),
     );
+    assert.equal(kept.length, config.models.length);
   }
+
+  // Other failures surface so magpie logs them.
+  await assert.rejects(
+    () => discoverGatewayModels(config, discoveryContext() as any, async () => new Response("boom", { status: 500 })),
+    /answered 500/,
+  );
+  await assert.rejects(
+    () => discoverGatewayModels(config, discoveryContext() as any, async () => new Response(JSON.stringify({ data: [] }), { status: 200 })),
+    /returned no models/,
+  );
   await assert.rejects(
     () => discoverGatewayModels(config, discoveryContext({ credential: { type: "oauth" } }) as any, async () => {
       throw new Error("must not be called");

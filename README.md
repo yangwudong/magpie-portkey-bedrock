@@ -48,27 +48,25 @@ The package ships this public default in `config.json`:
 ```json
 {
   "baseUrl": "https://api.portkey.ai/v1",
-  "apiKeyEnv": "PORTKEY_API_KEY",
   "provider": "aws-bedrock",
   "headers": {}
 }
 ```
 
-Create `config.local.json` beside `index.ts` to override it. That file is ignored by git and excluded from the npm package. You can also set `PORTKEY_CONFIG_PATH` to an absolute configuration file path in magpie's launch environment. Loading order is `PORTKEY_CONFIG_PATH`, then `config.local.json`, then `config.json`; each selects a complete configuration file.
+Create `config.local.json` beside `index.ts` to override it. That file is ignored by git and excluded from the npm package. Loading order is `config.local.json`, then `config.json`; each selects a complete configuration file. There are no environment variables — routing comes from these files, credentials come from magpie's sign-in.
 
 - `baseUrl`: your Portkey gateway's Bedrock-compatible base URL. Requests go to `/model/{encoded model id}/converse-stream`.
-- `apiKeyEnv`: environment fallback when pi has no saved key. In magpie, use API-key sign-in so the menu bar app does not need your shell environment.
 - `provider`: optional `x-portkey-provider` route. Set this to your configured Portkey AWS provider slug, such as `@your-aws-provider`, when using a provider integration.
 - `configId`: optional `x-portkey-config` configuration id. Use a route or configuration with AWS credentials already configured in Portkey.
 - `headers`: additional non-secret gateway headers.
 
-Unset `baseUrl`, `provider` and `configId` fall back to the `PORTKEY_BASE_URL`, `PORTKEY_PROVIDER` and `PORTKEY_CONFIG_ID` environment variables; config-file values win. This matters for updates: reinstalling an npm/GitHub plugin replaces its directory, so a `config.local.json` created inside it is lost — environment variables (or `PORTKEY_CONFIG_PATH` pointing outside the package) survive. If you install from a local folder (`magpie plugin add /path/to/checkout`), `config.local.json` lives in your own checkout and is never touched.
+This matters for updates: reinstalling an npm/GitHub plugin replaces its directory, so a `config.local.json` created inside it is lost and must be recreated. If you install from a local folder (`magpie plugin add /path/to/checkout`), `config.local.json` lives in your own checkout and is never touched.
 
-Credentials belong in magpie's sign-in or the environment. The config reader rejects API keys and secret headers embedded in JSON (`apiKey`, `virtualKey`, `authorization`, `*-api-key`, `token`, `secret`, `cookie`). Requests send the selected account's key as both `Authorization: Bearer …` and `x-portkey-api-key`. Restart the plugin after configuration changes.
+Credentials belong in magpie's sign-in — never in config files. The config reader rejects API keys and secret headers embedded in JSON (`apiKey`, `virtualKey`, `authorization`, `*-api-key`, `token`, `secret`, `cookie`). Requests send the selected account's key as both `Authorization: Bearer …` and `x-portkey-api-key`. Restart the plugin after configuration changes.
 
 ## Models
 
-`models.json` is an editable catalog. Set `PORTKEY_MODELS_PATH` to an absolute file path to keep it outside the package. Entries may be model ID strings or objects with `id`, `name`, `reasoning`, `thinkingLevelMap`, `input`, `contextWindow`, `maxTokens` and `cost`. Prices are USD per million tokens, with separate `input`, `output`, `cacheRead` and `cacheWrite` values.
+`models.json` is an editable catalog. Entries may be model ID strings or objects with `id`, `name`, `reasoning`, `thinkingLevelMap`, `input`, `contextWindow`, `maxTokens` and `cost`. Prices are USD per million tokens, with separate `input`, `output`, `cacheRead` and `cacheWrite` values.
 
 The included catalog covers the current Bedrock line-up plus common Amazon / DeepSeek / Meta / Mistral models. Availability, limits and prices depend on your AWS account and Portkey route; update the catalog to match them. When an account is signed in, magpie refreshes the list through the provider's `refreshModels`: the gateway's `/models` response is merged with the catalog — catalog entries keep their metadata, unknown ids are added with conservative defaults.
 

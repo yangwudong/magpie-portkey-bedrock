@@ -40,13 +40,13 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
   upstream.listen(0, "127.0.0.1");
   await once(upstream, "listening");
   const port = (upstream.address() as { port: number }).port;
-  writeFileSync(join(temp, "config.json"), JSON.stringify({
-    baseUrl: `http://127.0.0.1:${port}/v1`, apiKeyEnv: "PORTKEY_TEST_UNSET_KEY", provider: "@aws-test", headers: {},
+  writeFileSync(join(root, "config.local.json"), JSON.stringify({
+    baseUrl: `http://127.0.0.1:${port}/v1`, provider: "@aws-test", headers: {},
   }));
   writeFileSync(join(temp, "auth.json"), "{}");
   const child = spawn(process.env.BUN_BIN ?? "bun", [join(source!, "internal/plugin/host.js")], {
     cwd: temp,
-    env: { ...process.env, PORTKEY_CONFIG_PATH: join(temp, "config.json"), PORTKEY_MODELS_PATH: join(root, "models.json"), DO_NOT_TRACK: "1" },
+    env: { ...process.env, DO_NOT_TRACK: "1" },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stderr = "";
@@ -160,6 +160,7 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
     lines.close();
     upstream.closeAllConnections();
     await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    rmSync(join(root, "config.local.json"), { force: true });
     rmSync(temp, { recursive: true, force: true });
   }
 });

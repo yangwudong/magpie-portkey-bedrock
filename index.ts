@@ -64,7 +64,6 @@ interface ModelConfig {
 
 interface PortkeyConfig {
   baseUrl: string;
-  apiKeyEnv: string;
   provider?: string;
   configId?: string;
   headers: Record<string, string>;
@@ -127,42 +126,29 @@ export function readConfig(configPath = CONFIG_PATH, modelsPath = MODELS_PATH): 
   }
 
   const raw = value as Record<string, unknown>;
-  for (const forbidden of ["apiKey", "anthropicApiKey", "authToken", "virtualKey"]) {
+  for (const forbidden of ["apiKey", "api_key", "anthropicApiKey", "authToken", "virtualKey"]) {
     if (forbidden in raw) {
-      throw new Error(`${configPath}: ${forbidden} is a secret and must stay in the environment or Magpie’s API-key sign-in`);
+      throw new Error(`${configPath}: ${forbidden} is a secret and must stay in Magpie's API-key sign-in, not in config JSON`);
     }
   }
-  // Routing values may also come from the environment (config file wins).
-  const fromEnv = (name: string): string | undefined => {
-    const v = process.env[name]?.trim();
-    return v ? v : undefined;
-  };
-  const baseUrl = raw.baseUrl === undefined ? fromEnv("PORTKEY_BASE_URL") : raw.baseUrl;
-  if (typeof baseUrl !== "string" || baseUrl.length === 0) {
-    throw new Error(`${configPath}: baseUrl must be a non-empty string (or set PORTKEY_BASE_URL)`);
+  if (typeof raw.baseUrl !== "string" || raw.baseUrl.length === 0) {
+    throw new Error(`${configPath}: baseUrl must be a non-empty string`);
   }
-  const apiKeyEnv = raw.apiKeyEnv ?? "PORTKEY_API_KEY";
-  if (typeof apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv)) {
-    throw new Error(`${configPath}: apiKeyEnv must be a valid environment variable name`);
-  }
-  const provider = raw.provider !== undefined ? raw.provider : fromEnv("PORTKEY_PROVIDER");
-  if (provider !== undefined && typeof provider !== "string") {
+  if (raw.provider !== undefined && typeof raw.provider !== "string") {
     throw new Error(`${configPath}: provider must be a string`);
   }
-  const configId = raw.configId !== undefined ? raw.configId : fromEnv("PORTKEY_CONFIG_ID");
-  if (configId !== undefined && typeof configId !== "string") {
+  if (raw.configId !== undefined && typeof raw.configId !== "string") {
     throw new Error(`${configPath}: configId must be a string`);
   }
 
   const headers = readHeaders(raw.headers, configPath);
-  if (provider) headers["x-portkey-provider"] = provider;
-  if (configId) headers["x-portkey-config"] = configId;
+  if (raw.provider) headers["x-portkey-provider"] = raw.provider;
+  if (raw.configId) headers["x-portkey-config"] = raw.configId;
 
   return {
-    baseUrl,
-    apiKeyEnv,
-    provider,
-    configId,
+    baseUrl: raw.baseUrl,
+    provider: raw.provider,
+    configId: raw.configId,
     headers,
     models: readModels(readJsonFile(modelsPath), modelsPath),
   };
@@ -720,7 +706,11 @@ export async function discoverGatewayModels(
     },
     signal: context.signal,
   });
-  if (!res.ok) throw new Error(`portkey-bedrock: GET ${base}/models answered ${res.status}`);
+  if (!res.ok) {
+    // Gateways that don't expose a model list are fine: keep the catalog quietly.
+    if (res.status === 403 || res.status === 404) return toProviderModels(config.models, config.headers);
+    throw new Error(`portkey-bedrock: GET ${base}/models answered ${res.status}`);
+  }
 
   const body = await res.json();
   const entries = Array.isArray(body?.data) ? body.data : Array.isArray(body) ? body : [];
@@ -747,13 +737,12 @@ export async function discoverGatewayModels(
 }
 
 export default function portkeyAwsExtension(pi: ExtensionAPI): void {
-  const config = readConfig(process.env.PORTKEY_CONFIG_PATH, process.env.PORTKEY_MODELS_PATH);
+  const config = readConfig();
   const models = toProviderModels(config.models, config.headers);
 
   pi.registerProvider(PROVIDER_ID, {
     name: "Portkey Bedrock (Vercel AI SDK)",
     baseUrl: config.baseUrl,
-    apiKey: `$${config.apiKeyEnv}`,
     api: API_ID,
     headers: config.headers,
     models,
