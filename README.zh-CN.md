@@ -70,23 +70,23 @@ magpie 会按需安装 Bun、插件的运行时依赖和它的 pi 运行时。�
 
 内置目录覆盖当前 Bedrock 主力型号，外加常见的 Amazon / DeepSeek / Meta / Mistral 模型。可用性、上限和价格取决于你的 AWS 账号和 Portkey 路由，请按需调整目录。账号登录后，magpie 会通过 provider 的 `refreshModels` 刷新列表：网关 `/models` 的响应与目录合并——目录条目保留自己的元数据，未知 id 以保守默认值加入。
 
-| 模型 id | 上下文 | 最大输出 |
-| --- | ---: | ---: |
-| `us.anthropic.claude-haiku-4-5-20251001-v1:0` | 200,000 | 64,000 |
-| `us.anthropic.claude-opus-4-8` | 1,000,000 | 64,000 |
-| `us.anthropic.claude-opus-5` | 1,000,000 | 64,000 |
-| `us.anthropic.claude-opus-5-5` | 1,000,000 | 128,000 |
-| `us.anthropic.claude-sonnet-5` | 1,000,000 | 64,000 |
-| `us.anthropic.claude-sonnet-5-5` | 1,000,000 | 128,000 |
-| `anthropic.claude-sonnet-4-5-20250929-v1:0` | 200,000 | 64,000 |
-| `anthropic.claude-3-5-haiku-20241022-v1:0` | 200,000 | 8,192 |
-| `amazon.nova-premier-v1:0` | 1,000,000 | 32,000 |
-| `amazon.nova-pro-v1:0` | 300,000 | 6,400 |
-| `amazon.nova-lite-v1:0` | 300,000 | 6,400 |
-| `amazon.nova-micro-v1:0` | 128,000 | 4,096 |
-| `deepseek.r1-v1:0` | 128,000 | 8,192 |
-| `meta.llama3-3-70b-instruct-v1:0` | 128,000 | 8,192 |
-| `mistral.pixtral-large-2502-v1:0` | 128,000 | 8,192 |
+| 名称 | 模型 id | 上下文 | 最大输出 |
+| --- | --- | ---: | ---: |
+| Claude Haiku 4.5 | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | 200,000 | 64,000 |
+| Claude Opus 4.8 | `us.anthropic.claude-opus-4-8` | 1,000,000 | 64,000 |
+| Claude Opus 5 | `us.anthropic.claude-opus-5` | 1,000,000 | 64,000 |
+| Claude Opus 5.5 | `us.anthropic.claude-opus-5-5` | 1,000,000 | 128,000 |
+| Claude Sonnet 5 | `us.anthropic.claude-sonnet-5` | 1,000,000 | 64,000 |
+| Claude Sonnet 5.5 | `us.anthropic.claude-sonnet-5-5` | 1,000,000 | 128,000 |
+| Claude Sonnet 4.5 | `anthropic.claude-sonnet-4-5-20250929-v1:0` | 200,000 | 64,000 |
+| Claude 3.5 Haiku | `anthropic.claude-3-5-haiku-20241022-v1:0` | 200,000 | 8,192 |
+| Nova Premier | `amazon.nova-premier-v1:0` | 1,000,000 | 32,000 |
+| Nova Pro | `amazon.nova-pro-v1:0` | 300,000 | 6,400 |
+| Nova Lite | `amazon.nova-lite-v1:0` | 300,000 | 6,400 |
+| Nova Micro | `amazon.nova-micro-v1:0` | 128,000 | 4,096 |
+| DeepSeek R1 | `deepseek.r1-v1:0` | 128,000 | 8,192 |
+| Llama 3.3 70B | `meta.llama3-3-70b-instruct-v1:0` | 128,000 | 8,192 |
+| Pixtral Large | `mistral.pixtral-large-2502-v1:0` | 128,000 | 8,192 |
 
 ## 在 pi 里使用
 

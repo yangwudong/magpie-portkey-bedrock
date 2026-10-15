@@ -220,7 +220,7 @@ test("model discovery merges gateway models with the catalog", async () => {
   const merged = await discoverGatewayModels(config, discoveryContext() as any, send as any);
 
   const known = merged.find((m: any) => m.id === "us.anthropic.claude-sonnet-5-5")! as any;
-  assert.equal(known.name, "us.anthropic.claude-sonnet-5-5");
+  assert.equal(known.name, "Claude Sonnet 5.5");
   assert.equal(known.contextWindow, 1_000_000);
 
   const custom = merged.find((m: any) => m.id === "vendor.custom-model-v1:0")! as any;

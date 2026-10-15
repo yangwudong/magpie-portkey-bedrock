@@ -665,7 +665,7 @@ export interface GatewayModelContext {
 function toProviderModels(models: ModelConfig[], headers: Record<string, string>): ProviderModelConfig[] {
   return models.map((model) => ({
     id: model.id,
-    name: model.name || `${model.id} (Portkey via AI SDK)`,
+    name: model.name || model.id,
     reasoning: model.reasoning ?? true,
     thinkingLevelMap: model.thinkingLevelMap,
     input: model.input ?? (["text", "image"] as Array<"text" | "image">),
@@ -724,7 +724,7 @@ export async function discoverGatewayModels(
     known.add(id);
     merged.push({
       id,
-      name: (typeof entry === "object" && entry.name) || `${id} (Portkey via AI SDK)`,
+      name: (typeof entry === "object" && entry.name) || id,
       reasoning: false,
       input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -741,7 +741,7 @@ export default function portkeyAwsExtension(pi: ExtensionAPI): void {
   const models = toProviderModels(config.models, config.headers);
 
   pi.registerProvider(PROVIDER_ID, {
-    name: "Portkey Bedrock (Vercel AI SDK)",
+    name: "Portkey Bedrock",
     baseUrl: config.baseUrl,
     api: API_ID,
     headers: config.headers,

@@ -68,25 +68,25 @@ Credentials belong in magpie's sign-in — never in config files. The config rea
 
 `models.json` is an editable catalog. Entries may be model ID strings or objects with `id`, `name`, `reasoning`, `thinkingLevelMap`, `input`, `contextWindow`, `maxTokens` and `cost`. Prices are USD per million tokens, with separate `input`, `output`, `cacheRead` and `cacheWrite` values.
 
-The included catalog covers the current Bedrock line-up plus common Amazon / DeepSeek / Meta / Mistral models. Availability, limits and prices depend on your AWS account and Portkey route; update the catalog to match them. When an account is signed in, magpie refreshes the list through the provider's `refreshModels`: the gateway's `/models` response is merged with the catalog — catalog entries keep their metadata, unknown ids are added with conservative defaults.
+The included catalog covers the current Bedrock line-up plus common Amazon / DeepSeek / Meta / Mistral models. Availability, limits and prices depend on your AWS account and Portkey route; update the catalog to match them. When an account is signed in, magpie refreshes the list through the provider's `refreshModels`: the gateway's `/models` response is merged with the catalog — catalog entries keep their metadata, unknown ids are added with conservative defaults. The catalog's `name` is what magpie's model picker displays (e.g. `Claude Opus 5.5` instead of the raw Bedrock id); the id remains what requests use.
 
-| Model id | Context | Max output |
-| --- | ---: | ---: |
-| `us.anthropic.claude-haiku-4-5-20251001-v1:0` | 200,000 | 64,000 |
-| `us.anthropic.claude-opus-4-8` | 1,000,000 | 64,000 |
-| `us.anthropic.claude-opus-5` | 1,000,000 | 64,000 |
-| `us.anthropic.claude-opus-5-5` | 1,000,000 | 128,000 |
-| `us.anthropic.claude-sonnet-5` | 1,000,000 | 64,000 |
-| `us.anthropic.claude-sonnet-5-5` | 1,000,000 | 128,000 |
-| `anthropic.claude-sonnet-4-5-20250929-v1:0` | 200,000 | 64,000 |
-| `anthropic.claude-3-5-haiku-20241022-v1:0` | 200,000 | 8,192 |
-| `amazon.nova-premier-v1:0` | 1,000,000 | 32,000 |
-| `amazon.nova-pro-v1:0` | 300,000 | 6,400 |
-| `amazon.nova-lite-v1:0` | 300,000 | 6,400 |
-| `amazon.nova-micro-v1:0` | 128,000 | 4,096 |
-| `deepseek.r1-v1:0` | 128,000 | 8,192 |
-| `meta.llama3-3-70b-instruct-v1:0` | 128,000 | 8,192 |
-| `mistral.pixtral-large-2502-v1:0` | 128,000 | 8,192 |
+| Name | Model id | Context | Max output |
+| --- | --- | ---: | ---: |
+| Claude Haiku 4.5 | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | 200,000 | 64,000 |
+| Claude Opus 4.8 | `us.anthropic.claude-opus-4-8` | 1,000,000 | 64,000 |
+| Claude Opus 5 | `us.anthropic.claude-opus-5` | 1,000,000 | 64,000 |
+| Claude Opus 5.5 | `us.anthropic.claude-opus-5-5` | 1,000,000 | 128,000 |
+| Claude Sonnet 5 | `us.anthropic.claude-sonnet-5` | 1,000,000 | 64,000 |
+| Claude Sonnet 5.5 | `us.anthropic.claude-sonnet-5-5` | 1,000,000 | 128,000 |
+| Claude Sonnet 4.5 | `anthropic.claude-sonnet-4-5-20250929-v1:0` | 200,000 | 64,000 |
+| Claude 3.5 Haiku | `anthropic.claude-3-5-haiku-20241022-v1:0` | 200,000 | 8,192 |
+| Nova Premier | `amazon.nova-premier-v1:0` | 1,000,000 | 32,000 |
+| Nova Pro | `amazon.nova-pro-v1:0` | 300,000 | 6,400 |
+| Nova Lite | `amazon.nova-lite-v1:0` | 300,000 | 6,400 |
+| Nova Micro | `amazon.nova-micro-v1:0` | 128,000 | 4,096 |
+| DeepSeek R1 | `deepseek.r1-v1:0` | 128,000 | 8,192 |
+| Llama 3.3 70B | `meta.llama3-3-70b-instruct-v1:0` | 128,000 | 8,192 |
+| Pixtral Large | `mistral.pixtral-large-2502-v1:0` | 128,000 | 8,192 |
 
 ## Use in pi
 
