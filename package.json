@@ -53,8 +53,8 @@
     ]
   },
   "dependencies": {
-    "@ai-sdk/amazon-bedrock": "5.0.57",
-    "ai": "7.0.66"
+    "@ai-sdk/amazon-bedrock": "5.0.116",
+    "ai": "7.0.141"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
