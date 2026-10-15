@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@jack-yang/magpie-portkey-bedrock",
+  "version": "0.4.0",
+  "description": "Portkey AWS Bedrock provider for Magpie and pi, with tools, vision, reasoning and prompt caching. Built on @ai-sdk/amazon-bedrock.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yangwudong/magpie-portkey-bedrock.git"
+  },
+  "homepage": "https://github.com/yangwudong/magpie-portkey-bedrock#readme",
+  "bugs": {
+    "url": "https://github.com/yangwudong/magpie-portkey-bedrock/issues"
+  },
+  "type": "module",
+  "main": "./index.ts",
+  "magpie": {
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTQiIGZpbGw9IiMyRTVCRkYiLz48cGF0aCBkPSJNMjQgNDZWMThoOWExMSAxMSAwIDAgMSAwIDIyaC05IiBmaWxsPSJub25lIiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iNiIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PC9zdmc+"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "pi-package",
+    "magpie-plugin",
+    "provider",
+    "magpie",
+    "portkey",
+    "bedrock",
+    "amazon-bedrock"
+  ],
+  "files": [
+    "index.ts",
+    "config.json",
+    "models.json",
+    "icon.svg",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19",
+    "bun": ">=1.3"
+  },
+  "scripts": {
+    "test": "bun test test/",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@ai-sdk/amazon-bedrock": "5.0.57",
+    "ai": "7.0.66"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.2.0",
+    "@earendil-works/pi-coding-agent": "1.2.0",
+    "@types/node": "^26.0.0",
+    "typescript": "^5.9.3"
+  }
+}

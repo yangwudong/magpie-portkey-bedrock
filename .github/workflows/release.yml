@@ -1,0 +1,28 @@
+name: Release
+
+# Publishes to npm with provenance via trusted publishing (OIDC), no npm token.
+# Register this workflow as a trusted publisher on npmjs.com first:
+# package settings -> Trusted Publisher -> repository yangwudong/magpie-portkey-bedrock,
+# workflow release.yml. Then push a version tag (v*) or run manually.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm publish --provenance
