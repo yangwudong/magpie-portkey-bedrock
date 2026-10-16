@@ -117,6 +117,41 @@ test("tool calls, text/image tool results and user images round-trip", async () 
   }
 });
 
+test("parallel tool calls and interleaved reasoning stream as separate blocks", async () => {
+  const events: WireEvent[] = [
+    ["messageStart", { role: "assistant" }],
+    // Bedrock auto-registers a reasoning block on first reasoning-delta; an
+    // explicit bare start would be typed as text and break the sequence.
+    ["contentBlockDelta", { contentBlockIndex: 0, delta: { reasoningContent: { text: "Plan: call both" } } }],
+    ["contentBlockDelta", { contentBlockIndex: 0, delta: { reasoningContent: { signature: "sig-p" } } }],
+    ["contentBlockStop", { contentBlockIndex: 0 }],
+    ["contentBlockStart", { contentBlockIndex: 1, start: { toolUse: { toolUseId: "call_a", name: "lookup" } } }],
+    ["contentBlockStart", { contentBlockIndex: 2, start: { toolUse: { toolUseId: "call_b", name: "lookup" } } }],
+    ["contentBlockDelta", { contentBlockIndex: 1, delta: { toolUse: { input: '{"q":' } } }],
+    ["contentBlockDelta", { contentBlockIndex: 2, delta: { toolUse: { input: '{"q":"b"}' } } }],
+    ["contentBlockDelta", { contentBlockIndex: 1, delta: { toolUse: { input: '"a"}' } } }],
+    ["contentBlockStop", { contentBlockIndex: 1 }],
+    ["contentBlockStop", { contentBlockIndex: 2 }],
+    ["contentBlockStart", { contentBlockIndex: 3, start: {} }],
+    ["contentBlockDelta", { contentBlockIndex: 3, delta: { text: "done" } }],
+    ["contentBlockStop", { contentBlockIndex: 3 }],
+    ...end("tool_use"),
+  ];
+  const { message, seen } = await ask(events);
+  assert.equal(message.stopReason, "toolUse", message.errorMessage ?? "");
+  assert.deepEqual(message.content.map((c) => c.type), ["thinking", "toolCall", "toolCall", "text"]);
+  const [thinking, toolA, toolB, text] = message.content as any[];
+  assert.equal(thinking.thinking, "Plan: call both");
+  assert.equal(thinking.thinkingSignature, "sig-p");
+  assert.deepEqual(toolA.arguments, { q: "a" });
+  assert.deepEqual(toolB.arguments, { q: "b" });
+  assert.equal(toolA.id, "call_a");
+  assert.equal(toolB.id, "call_b");
+  assert.equal(text.text, "done");
+  assert.equal(seen.filter((e) => e.type === "toolcall_end").length, 2);
+  assert.equal(seen.filter((e) => e.type === "thinking_end").length, 1);
+});
+
 test("foreign unsigned thinking becomes text", async () => {
   const foreign = { ...model, provider: "other" };
   const { message, captured } = await ask(textEvents(), { ...context, messages: [
@@ -184,8 +219,7 @@ test("rejects secrets embedded in the config", () => {
     assert.throws(() => readConfig(path, models), /secret/);
     writeFileSync(path, JSON.stringify({ baseUrl: "https://example.com", headers: { Authorization: "secret" } }));
     assert.throws(() => readConfig(path, models), /secret/);
-  } finally { rmSync(temp, { recursive: true }); }
-  let registered: any;
+  } finally { rmSync(temp, { recursive: true }); }  let registered: any;
   plugin({ registerProvider: (id: string, options: unknown) => { registered = { id, options }; } } as any);
   assert.equal(registered.id, "portkey-bedrock");
   assert.equal(registered.options.models.length, 15);
@@ -214,6 +248,8 @@ test("model discovery merges gateway models with the catalog", async () => {
         { id: "us.anthropic.claude-sonnet-5-5", name: "ignored, catalog wins" },
         { id: "vendor.custom-model-v1:0", name: "Custom Model" },
         "vendor.string-model-v1:0",
+        { id: "us.anthropic.claude-future-9-9" },
+        { id: "amazon.nova-pro-v2:0" },
       ],
     }), { status: 200 });
   };
@@ -227,11 +263,22 @@ test("model discovery merges gateway models with the catalog", async () => {
   assert.equal(custom.name, "Custom Model");
   assert.equal(custom.reasoning, false);
   assert.deepEqual(custom.input, ["text"]);
+  assert.equal(custom.contextWindow, 200_000);
+  assert.equal(custom.maxTokens, 8192);
+
+  // Anthropic/Nova ids discovered beyond the catalog get their family's defaults.
+  const family = merged.find((m: any) => m.id === "us.anthropic.claude-future-9-9")! as any;
+  assert.equal(family.reasoning, true);
+  assert.deepEqual(family.input, ["text", "image"]);
+  assert.equal(family.contextWindow, 1_000_000);
+  assert.equal(family.maxTokens, 64_000);
+  const nova = merged.find((m: any) => m.id === "amazon.nova-pro-v2:0")! as any;
+  assert.equal(nova.contextWindow, 1_000_000);
 
   const stringModel = merged.find((m: any) => m.id === "vendor.string-model-v1:0")!;
   assert.ok(String(stringModel.name).startsWith("vendor.string-model"));
 
-  assert.equal(merged.length, config.models.length + 2);
+  assert.equal(merged.length, config.models.length + 4);
   assert.equal(sent!.url, "https://portkey.example/v1/models");
   const headers = new Headers(sent!.init.headers);
   assert.equal(headers.get("x-portkey-api-key"), "pk-test");
@@ -245,6 +292,14 @@ test("model discovery fails closed and keeps the catalog", async () => {
     throw new Error("must not be called");
   });
   assert.equal(offline.length, config.models.length);
+
+  // The key may live in the credential's env map instead of a direct key.
+  let envKey: string | undefined;
+  await discoverGatewayModels(config, discoveryContext({ credential: { type: "api_key", env: { PORTKEY_API_KEY: "env-key" } } }) as any, async (_url: any, init: any) => {
+    envKey = new Headers(init.headers).get("x-portkey-api-key") ?? undefined;
+    return new Response(JSON.stringify({ data: ["vendor.env-v1:0"] }), { status: 200 });
+  });
+  assert.equal(envKey, "env-key");
 
   // Gateways that refuse to list models (403/404) keep the catalog quietly.
   for (const status of [403, 404]) {
@@ -271,6 +326,36 @@ test("model discovery fails closed and keeps the catalog", async () => {
     }),
     /no API key/,
   );
+});
+
+test("config validation covers headers, models and secret fields", () => {
+  const temp = mkdtempSync(join(tmpdir(), "portkey-config-"));
+  try {
+    const path = join(temp, "config.json");
+    const models = join(temp, "models.json");
+    const read = (config: unknown, modelsList: unknown = ["model-1"]) => {
+      writeFileSync(models, JSON.stringify(modelsList));
+      writeFileSync(path, JSON.stringify(config));
+      return readConfig(path, models);
+    };
+    // baseUrl and models shape
+    assert.throws(() => read({ baseUrl: "" }), /baseUrl/);
+    assert.throws(() => read({ baseUrl: "https://x.com" }, []), /non-empty array/);
+    assert.throws(() => read({ baseUrl: "https://x.com" }, [42]), /model ID/);
+    // provider / configId types
+    assert.throws(() => read({ baseUrl: "https://x.com", provider: 5 }), /provider must be a string/);
+    assert.throws(() => read({ baseUrl: "https://x.com", configId: [] }), /configId must be a string/);
+    // headers: array, non-string values
+    assert.throws(() => read({ baseUrl: "https://x.com", headers: [] }), /headers must be an object/);
+    assert.throws(() => read({ baseUrl: "https://x.com", headers: { "x-ok": 1 } }), /must be a string/);
+    // forbidden secret fields other than apiKey
+    for (const field of ["api_key", "authToken", "virtualKey"]) {
+      assert.throws(() => read({ baseUrl: "https://x.com", [field]: "s" }), /secret/);
+    }
+    // happy path: provider/configId become portkey headers
+    const config = read({ baseUrl: "https://x.com", provider: "aws-bedrock", configId: "cfg-1", headers: { "x-custom": "ok" } });
+    assert.deepEqual(config.headers, { "x-custom": "ok", "x-portkey-provider": "aws-bedrock", "x-portkey-config": "cfg-1" });
+  } finally { rmSync(temp, { recursive: true }); }
 });
 
 test("registered refreshModels lists models through the gateway", async () => {

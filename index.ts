@@ -2,9 +2,12 @@ import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
 import {
   jsonSchema,
   streamText,
+  type AssistantContent,
+  type FilePart,
   type FinishReason,
   type LanguageModelUsage,
   type ModelMessage,
+  type TextPart,
   type ToolSet,
 } from "ai";
 import {
@@ -72,8 +75,11 @@ interface PortkeyConfig {
 
 interface StreamBlockState {
   contentIndex: number;
-  partialJson?: string;
   ended: boolean;
+}
+
+interface ToolBlockState extends StreamBlockState {
+  partialJson?: string;
 }
 
 function readModels(value: unknown, configPath: string): ModelConfig[] {
@@ -164,7 +170,7 @@ function providerHeaders(
   };
 }
 
-function convertUserContent(content: string | Array<TextContent | ImageContent>): ModelMessage["content"] {
+function convertUserContent(content: string | Array<TextContent | ImageContent>): string | Array<TextPart | FilePart> {
   if (typeof content === "string") return content;
   return content.map((part) => {
     if (part.type === "text") return { type: "text" as const, text: part.text };
@@ -207,12 +213,12 @@ function convertMessages(messages: Message[]): ModelMessage[] {
 
   for (const message of messages) {
     if (message.role === "user") {
-      converted.push({ role: "user", content: convertUserContent(message.content) as never });
+      converted.push({ role: "user", content: convertUserContent(message.content) });
       continue;
     }
 
     if (message.role === "assistant") {
-      const content: Array<Record<string, unknown>> = [];
+      const content: AssistantContent = [];
       for (const block of message.content) {
         if (block.type === "text") {
           if (block.text) content.push({ type: "text", text: block.text });
@@ -242,7 +248,7 @@ function convertMessages(messages: Message[]): ModelMessage[] {
           });
         }
       }
-      if (content.length > 0) converted.push({ role: "assistant", content: content as never });
+      if (content.length > 0) converted.push({ role: "assistant", content });
       continue;
     }
 
@@ -276,7 +282,7 @@ function convertTools(tools: Tool[] | undefined): ToolSet | undefined {
   for (const tool of tools) {
     converted[tool.name] = {
       description: tool.description,
-      inputSchema: jsonSchema(tool.parameters as never),
+      inputSchema: jsonSchema(tool.parameters),
       outputSchema: jsonSchema({}),
     };
   }
@@ -414,7 +420,7 @@ function streamPortkeyAws(
     };
     const textBlocks = new Map<string, StreamBlockState>();
     const reasoningBlocks = new Map<string, StreamBlockState>();
-    const toolBlocks = new Map<string, StreamBlockState>();
+    const toolBlocks = new Map<string, ToolBlockState>();
 
     const ensureTextBlock = (id: string): StreamBlockState => {
       const existing = textBlocks.get(id);
@@ -438,7 +444,7 @@ function streamPortkeyAws(
       return state;
     };
 
-    const ensureToolBlock = (id: string, name: string): StreamBlockState => {
+    const ensureToolBlock = (id: string, name: string): ToolBlockState => {
       const existing = toolBlocks.get(id);
       if (existing) return existing;
       const state = { contentIndex: output.content.length, partialJson: "", ended: false };
@@ -681,6 +687,33 @@ function toProviderModels(models: ModelConfig[], headers: Record<string, string>
   }));
 }
 
+// The chat variant of the exported union; the package keeps the union member unexported.
+type ChatModelConfig = Extract<ProviderModelConfig, { reasoning: unknown }>;
+
+// The gateway's /models endpoint reports no metadata, so ids beyond the catalog
+// get conservative per-family defaults derived from Bedrock's own ID scheme.
+// Anthropic ids (and Nova Pro/Premier) ship 1M contexts and cache pricing;
+// everything else gets the generic floor. Zero cost keeps accounting honest
+// rather than inventing per-model prices.
+function discoveredModelDefaults(id: string): Pick<ChatModelConfig, "reasoning" | "input" | "cost" | "contextWindow" | "maxTokens"> {
+  if (/anthropic\./.test(id) || /nova-(premier|pro)-v/.test(id)) {
+    return {
+      reasoning: true,
+      input: ["text", "image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 1_000_000,
+      maxTokens: 64_000,
+    };
+  }
+  return {
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200_000,
+    maxTokens: 8192,
+  };
+}
+
 // Lists what the gateway actually serves (OpenAI-style GET /models) and merges
 // it with the catalog: catalog entries keep their metadata, unknown ids are
 // added with conservative defaults. Throws so magpie logs the reason and keeps
@@ -725,11 +758,7 @@ export async function discoverGatewayModels(
     merged.push({
       id,
       name: (typeof entry === "object" && entry.name) || id,
-      reasoning: false,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 200_000,
-      maxTokens: 8192,
+      ...discoveredModelDefaults(id),
       headers: config.headers,
     });
   }
