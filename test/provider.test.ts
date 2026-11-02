@@ -51,6 +51,7 @@ test("real Bedrock request: authentication, routing, tools, reasoning, caching a
   assert.equal(c.body.toolConfig.tools[0].toolSpec.name, "lookup");
   assert.equal(c.body.inferenceConfig.temperature, undefined); // Bedrock omits sampling while thinking.
   assert.equal(c.body.additionalModelRequestFields.output_config.effort, "max");
+  assert.equal(c.body.additionalModelRequestFields.thinking.display, "summarized"); // Otherwise the first token waits for the whole think.
   assert.equal(c.response.status, 200);
   assert.equal(c.response.headers["x-amzn-requestid"], "test-request");
   assert.ok(c.raw.length > 0);
@@ -66,6 +67,39 @@ test("empty text and length stops remain successful", async () => {
   assert.equal((await ask(events)).message.stopReason, "length");
 });
 
+test("content-filtered finishes surface as errors, not silent stops", async () => {
+  for (const stopReason of ["content_filtered", "guardrail_intervened"]) {
+    const events = textEvents();
+    events[events.length - 2] = ["messageStop", { stopReason }];
+    const { message } = await ask(events);
+    assert.equal(message.stopReason, "error");
+    assert.match(message.errorMessage!, /error finish reason/);
+  }
+});
+
+test("Nova-style redactedContent reasoning survives streaming and replay", async () => {
+  // The SDK accumulates opaque redactedContent deltas and emits the whole
+  // payload on reasoning-end; Anthropic-style redactedData arrives on deltas.
+  const events: WireEvent[] = [
+    ["messageStart", { role: "assistant" }],
+    ["contentBlockDelta", { contentBlockIndex: 0, delta: { reasoningContent: { redactedContent: "cGFydA==" } } }],
+    ["contentBlockDelta", { contentBlockIndex: 0, delta: { reasoningContent: { redactedContent: "Mg==" } } }],
+    ["contentBlockStop", { contentBlockIndex: 0 }], ...end(),
+  ];
+  const { message } = await ask(events);
+  assert.equal(message.stopReason, "stop", message.errorMessage ?? "");
+  assert.deepEqual(message.content, [
+    { type: "thinking", thinking: "", thinkingSignature: "cGFydA==Mg==", redacted: true },
+  ]);
+  const replay = await ask(textEvents(), { ...context, messages: [...context.messages, { ...message, model: "amazon.nova-2-lite-v1:0" }, { role: "user", content: "Continue", timestamp: 1 }] });
+  assert.equal(replay.message.stopReason, "stop", replay.message.errorMessage ?? "");
+  const reasoning = replay.captured.body.messages.find((m: any) => m.role === "assistant").content;
+  // Non-Anthropic models replay redacted reasoning as Converse's native
+  // top-level redactedContent member; Anthropic wraps it in redactedReasoning.
+  assert.equal(reasoning[0].reasoningContent.redactedContent, "cGFydA==Mg==");
+  const anthropicReplay = await ask(textEvents(), { ...context, messages: [...context.messages, message, { role: "user", content: "Continue", timestamp: 1 }] });
+  assert.equal(anthropicReplay.captured.body.messages.find((m: any) => m.role === "assistant").content[0].reasoningContent.redactedReasoning.data, "cGFydA==Mg==");
+});
 test("signed and redacted reasoning survives streaming and replay", async () => {
   const events: WireEvent[] = [
     ["messageStart", { role: "assistant" }],

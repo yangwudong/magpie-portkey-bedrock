@@ -218,6 +218,11 @@ function convertMessages(messages: Message[]): ModelMessage[] {
     }
 
     if (message.role === "assistant") {
+      // Converse's ReasoningContentBlock union carries redacted reasoning as a
+      // top-level redactedContent member, but Anthropic models take it wrapped
+      // in redactedReasoning.data instead. Replay each block the way its model
+      // originally delivered it.
+      const anthropicRedaction = /anthropic\./.test(message.model ?? "");
       const content: AssistantContent = [];
       for (const block of message.content) {
         if (block.type === "text") {
@@ -225,7 +230,13 @@ function convertMessages(messages: Message[]): ModelMessage[] {
         } else if (block.type === "thinking") {
           const thinking = block as ThinkingContent;
           if (thinking.redacted && thinking.thinkingSignature) {
-            content.push({ type: "reasoning", text: "", providerOptions: { bedrock: { redactedData: thinking.thinkingSignature } } });
+            content.push({
+              type: "reasoning",
+              text: "",
+              providerOptions: anthropicRedaction
+                ? { bedrock: { redactedData: thinking.thinkingSignature } }
+                : { bedrock: { redactedContent: thinking.thinkingSignature } },
+            });
             continue;
           }
           if (!thinking.thinking) continue;
@@ -311,6 +322,10 @@ function bedrockReasoningOptions(model: Model<Api>, level: SimpleStreamOptions["
     bedrock: {
       reasoningConfig: {
         type: "adaptive" as const,
+        // Bedrock omits thinking unless display asks for it, so a long think
+        // sends nothing until the answer starts: the first token then waits for
+        // the whole reasoning pass. Summarized thinking streams as it happens.
+        display: "summarized" as const,
         maxReasoningEffort: effort as "low" | "medium" | "high" | "xhigh" | "max",
       },
     },
@@ -324,6 +339,11 @@ function mapFinishReason(reason: FinishReason): StopReason {
     case "length":
       return "length";
     case "error":
+      return "error";
+    // Bedrock reports guardrail interventions and safety filtering this way.
+    // The finish handler turns it into an explicit error below so a filtered
+    // response never looks like a complete one.
+    case "content-filter":
       return "error";
     default:
       return "stop";
@@ -350,10 +370,16 @@ function applyReasoningMetadata(block: ThinkingContent, metadata: unknown): void
   for (const key of ["amazonBedrock", "bedrock"]) {
     const entry = (metadata as Record<string, unknown>)[key];
     if (!entry || typeof entry !== "object") continue;
-    const { signature, redactedData } = entry as Record<string, unknown>;
+    const { signature, redactedData, redactedContent } = entry as Record<string, unknown>;
     if (typeof signature === "string" && signature) block.thinkingSignature = signature;
+    // redactedData is Anthropic's redactedReasoning; redactedContent is the
+    // Nova-style opaque reasoning the SDK accumulates and emits at block end.
     if (typeof redactedData === "string" && redactedData) {
       block.thinkingSignature = redactedData;
+      block.redacted = true;
+    }
+    if (typeof redactedContent === "string" && redactedContent) {
+      block.thinkingSignature = redactedContent;
       block.redacted = true;
     }
   }

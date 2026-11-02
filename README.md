@@ -11,7 +11,7 @@ The provider id is **`portkey-bedrock`**. Its models are available to every agen
 - Native Bedrock Converse streaming through `@ai-sdk/amazon-bedrock`.
 - Dynamic model discovery: once an account is signed in, the provider asks the gateway for its model list (`GET /v1/models`) and merges what your account actually serves into the catalog; failures keep the catalog.
 - Text, vision, streamed tool arguments and tool results, including image results and failed tools.
-- Reasoning levels, including `xhigh` and `max` where declared; signed and redacted reasoning survives replay.
+- Reasoning levels, including `xhigh` and `max` where declared; signed and redacted reasoning survives replay. Thinking streams with `display: summarized`, so the first token arrives while the model reasons instead of after the whole reasoning pass.
 - Two explicit prompt-cache checkpoints (system prompt and final conversation message) — Bedrock only caches at explicit checkpoints, so this is what makes prompt caching actually work on Anthropic models.
 - Input, output, cache-read and cache-write token accounting with catalog prices.
 - Cancellation, request timeouts, payload inspection and response hooks.
@@ -63,6 +63,8 @@ Create `config.local.json` beside `index.ts` to override it. That file is ignore
 This matters for updates: reinstalling an npm/GitHub plugin replaces its directory, so a `config.local.json` created inside it is lost and must be recreated. If you install from a local folder (`magpie plugin add /path/to/checkout`), `config.local.json` lives in your own checkout and is never touched.
 
 Credentials belong in magpie's sign-in — never in config files. The config reader rejects API keys and secret headers embedded in JSON (`apiKey`, `virtualKey`, `authorization`, `*-api-key`, `token`, `secret`, `cookie`). Requests send the selected account's key as both `Authorization: Bearer …` and `x-portkey-api-key`. Restart the plugin after configuration changes.
+
+Requests are sent uncompressed. Portkey's deployed gateway reads the body as plain JSON and does not decompress: a gzip or deflate body answers `400` with `Value null at 'messages'` even at 95 bytes, on both `/model/{id}/converse-stream` and `/v1/messages`. Compressing the request needs the gateway to enable request decompression first. Responses are also sent uncompressed, and `Accept-Encoding: gzip, br` changes nothing.
 
 ## Models
 

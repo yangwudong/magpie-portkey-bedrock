@@ -11,7 +11,7 @@ English documentation: [README.md](./README.md)
 - 经 `@ai-sdk/amazon-bedrock` 的原生 Bedrock Converse 流式输出。
 - 动态模型发现：账号登录后，provider 会请求网关的模型列表（`GET /v1/models`），把你的账号实际可用的模型合并进目录；失败时保留目录。
 - 文本、视觉、流式工具参数与工具结果，包括图片结果和失败的工具。
-- 推理强度档位（声明处含 `xhigh`、`max`）；带签名和已脱敏的思考在回放时保留。
+- 推理强度档位（声明处含 `xhigh`、`max`）；带签名和已脱敏的思考在回放时保留。思考以 `display: summarized` 流式输出，首个 token 在模型推理时即可到达，而不是等整个推理结束。
 - 两个显式 prompt-cache 检查点（系统提示词和最后一条对话消息）——Bedrock 只在显式检查点写缓存，这正是让 Anthropic 模型的 prompt caching 真正生效的机制。
 - input/output/cache-read/cache-write token 用量统计，按目录价计算成本。
 - 取消、请求超时、载荷检查和响应钩子。
@@ -63,6 +63,8 @@ magpie 会按需安装 Bun、插件的运行时依赖和它的 pi 运行时。�
 这关系到插件更新：重装 npm/GitHub 插件会替换它的目录，装在里面的 `config.local.json` 会丢，需要重新建一份。用本地文件夹安装（`magpie plugin add /path/to/checkout`）时，`config.local.json` 在你自己的检出里，永远不会被动到。
 
 凭证只放在 magpie 的登录里，绝不进配置文件。配置读取器会拒绝嵌在 JSON 里的 API key 和敏感头（`apiKey`、`virtualKey`、`authorization`、`*-api-key`、`token`、`secret`、`cookie`）。请求同时以 `Authorization: Bearer …` 和 `x-portkey-api-key` 携带所选账号的 key。改完配置重启插件生效。
+
+请求以未压缩形式发送。Portkey 线上网关按纯 JSON 解析请求体、不做解压：gzip 或 deflate 的请求体在 `/model/{id}/converse-stream` 和 `/v1/messages` 上都会返回 `400`（`Value null at 'messages'`），即使只有 95 字节也一样。要压缩请求需要网关先支持请求解压。响应同样不压缩，发 `Accept-Encoding: gzip, br` 也不会改变响应头。
 
 ## 模型
 
