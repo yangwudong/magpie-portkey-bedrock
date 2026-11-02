@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@jack-yang/magpie-portkey-bedrock",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Portkey AWS Bedrock provider for Magpie and pi, with tools, vision, reasoning and prompt caching. Built on @ai-sdk/amazon-bedrock.",
   "repository": {
     "type": "git",
@@ -53,16 +53,16 @@
     ]
   },
   "dependencies": {
-    "@ai-sdk/amazon-bedrock": "5.0.116",
-    "ai": "7.0.141"
+    "@ai-sdk/amazon-bedrock": "^5.0.130",
+    "ai": "^7.0.159"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.2.0",
-    "@earendil-works/pi-coding-agent": "1.2.0",
+    "@earendil-works/pi-ai": "^1.5.0",
+    "@earendil-works/pi-coding-agent": "^1.5.0",
     "@types/node": "^26.0.0",
     "typescript": "^5.9.3"
   }
