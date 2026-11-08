@@ -6,13 +6,22 @@
 
 English documentation: [README.md](./README.md)
 
+> [!IMPORTANT]
+> **从 1.2.x 及更早版本升级：请重新登录所有账号。** 每个账号的网关、路由和名称现在都来自登录表单，配置文件不再决定路由。
+>
+> 1. **登出所有已有的 Portkey Bedrock 账号**（Providers → Portkey Bedrock）。旧版本的账号只有 key、没有网关，它的请求会以 `Provider is not configured` 失败。这些请求不会发出，key 不会离开你的机器。
+> 2. **用表单重新登录**：网关地址、provider slug、API key，以及选填的名称。
+> 3. **删除 `index.ts` 旁的 `config.local.json`**，如果里面只有 `baseUrl` 和 `provider`。它们现在会被忽略；只有 `configId` 和额外的 `headers` 仍然生效（见[配置网关](#配置网关)）。
+
 ## 功能
 
 - 经 `@ai-sdk/amazon-bedrock` 的原生 Bedrock Converse 流式输出。
-- 动态模型发现：账号登录后，provider 会请求网关的模型列表（`GET /v1/models`），把你的账号实际可用的模型合并进目录；失败时保留目录。
-- 文本、视觉、流式工具参数与工具结果，包括图片结果和失败的工具。
+- GUI 登录表单：**网关地址、Portkey provider slug、API key**，外加选填的账号名称——无需改配置文件、无需浏览器。每个账号路由到自己的网关。
+- 多账号：每个已登录账号自带 key、网关地址和 provider 路由；magpie 按账号做轮转、故障切换和限流。
+- 动态模型发现：账号登录后，provider 会请求**该账号网关**的模型列表（`GET /v1/models`），把账号实际可用的模型合并进目录；失败时保留目录。
+- 文本、视觉、流式工具参数与工具结果，包括图片结果和失败的工具。工具参数按增量解析——耗时与流长度线性相关，而非平方级。
 - 推理强度档位（声明处含 `xhigh`、`max`）；带签名和已脱敏的思考在回放时保留。思考以 `display: summarized` 流式输出，首个 token 在模型推理时即可到达，而不是等整个推理结束。
-- 两个显式 prompt-cache 检查点（系统提示词和最后一条对话消息）——Bedrock 只在显式检查点写缓存，这正是让 Anthropic 模型的 prompt caching 真正生效的机制。
+- prompt-cache 检查点按模型家族下发（仅 Claude 与 Nova——其余 Bedrock 家族会忽略或拒绝 `cachePoint`），支持 `cacheRetention`，包括 Bedrock 的一小时 TTL（`long`）。
 - input/output/cache-read/cache-write token 用量统计，按目录价计算成本。
 - 取消、请求超时、载荷检查和响应钩子。
 - HTTP 状态码和重试头转发给 magpie，接入它的路由与故障切换。
@@ -31,7 +40,16 @@ git clone https://github.com/yangwudong/magpie-portkey-bedrock.git
 magpie plugin add "$PWD/magpie-portkey-bedrock"
 ```
 
-然后用你的 **Portkey 网关 API key** 登录（`magpie plugin login portkey-bedrock`，或在应用里 Providers 页点登录）。magpie 把它存在配置目录的 `plugin-auth.json`，每次请求带上账号的 key。支持多账号。
+然后用你的 **Portkey 网关账号**登录（在应用里 Providers 页点登录，或 `magpie plugin login portkey-bedrock`）。登录表单依次提问，答完最后一项就保存账号——不开浏览器，也没有别的确认步骤：
+
+1. **网关地址（Base URL）**——该账号的 Portkey 网关 Bedrock 兼容地址。请求发往 `/model/{编码后的模型 id}/converse-stream`。
+2. **Provider slug**——该账号的 `x-portkey-provider` 路由，例如 `@your-aws-provider`。
+3. **API key**——该账号的 Portkey 网关 key。
+4. **账号名称**（选填）——magpie 列表里显示的名字。留空则用 key 的首尾各四位命名，形如 `API key AbCd…Yz12`，key 的其余部分不会显示。
+
+名称即账号身份：用一个已有账号的名称再次登录，会更新那个账号（换 key、网关或路由），而不是新增一个。请给每个账号起不同的名字。
+
+网关地址或 slug 留空，即使用输入框提示里的 Portkey 公共默认值（`https://api.portkey.ai/v1`、`aws-bedrock`）；提示永远不会显示你自己的配置。magpie 把每次登录存进配置目录的 `plugin-auth.json`。每多一个账号就再登录一次：各账号保留自己的 key、网关和 provider 路由，magpie 的路由、故障切换和账号限额按账号生效。请求同时以 `Authorization: Bearer …` 和 `x-portkey-api-key` 携带所选账号的 key。
 
 在 **Providers → Portkey Bedrock** 里展开，给 agent 选 `portkey-bedrock/…` 模型：
 
@@ -43,26 +61,21 @@ magpie 会按需安装 Bun、插件的运行时依赖和它的 pi 运行时。�
 
 ## 配置网关
 
-包里带的公共默认 `config.json`：
+无需任何配置：每个账号的网关和路由都来自它的登录表单，包里也不带配置文件。
+
+如果网关需要所有账号共用的设置，可以写进 `index.ts` 旁可选的 `config.local.json`（被 git 忽略、不进 npm 包）：
 
 ```json
 {
-  "baseUrl": "https://api.portkey.ai/v1",
-  "provider": "aws-bedrock",
-  "headers": {}
+  "configId": "pc-your-config",
+  "headers": { "x-portkey-trace-id": "magpie" }
 }
 ```
 
-在 `index.ts` 旁边建 `config.local.json` 覆盖它。该文件被 git 忽略，也不会进 npm 包。加载顺序：`config.local.json` → `config.json`，每次选定一份完整配置。**不使用任何环境变量**——路由来自这两个文件，凭证来自 magpie 的登录。
+- `configId`：随所有账号请求发送的 `x-portkey-config` 配置 id。
+- `headers`：随所有账号请求发送的额外非敏感网关头。
 
-- `baseUrl`：你的 Portkey 网关的 Bedrock 兼容地址。请求发往 `/model/{编码后的模型 id}/converse-stream`。
-- `provider`：可选的 `x-portkey-provider` 路由。用 provider 集成时填你配置的 Portkey AWS provider slug，例如 `@your-aws-provider`。
-- `configId`：可选的 `x-portkey-config` 配置 id。使用已在 Portkey 配好 AWS 凭证的路由或配置。
-- `headers`：额外的非敏感网关头。
-
-这关系到插件更新：重装 npm/GitHub 插件会替换它的目录，装在里面的 `config.local.json` 会丢，需要重新建一份。用本地文件夹安装（`magpie plugin add /path/to/checkout`）时，`config.local.json` 在你自己的检出里，永远不会被动到。
-
-凭证只放在 magpie 的登录里，绝不进配置文件。配置读取器会拒绝嵌在 JSON 里的 API key 和敏感头（`apiKey`、`virtualKey`、`authorization`、`*-api-key`、`token`、`secret`、`cookie`）。请求同时以 `Authorization: Bearer …` 和 `x-portkey-api-key` 携带所选账号的 key。改完配置重启插件生效。
+旧版本文件里的 `baseUrl` 和 `provider` 会被忽略——它们已不决定任何路由。凭证只放在 magpie 的登录里，不进这个文件：读取器会拒绝 API key 和敏感头（`apiKey`、`virtualKey`、`authorization`、`*-api-key`、`token`、`secret`、`cookie`）。改完重启插件生效。
 
 请求以未压缩形式发送。Portkey 线上网关按纯 JSON 解析请求体、不做解压：gzip 或 deflate 的请求体在 `/model/{id}/converse-stream` 和 `/v1/messages` 上都会返回 `400`（`Value null at 'messages'`），即使只有 95 字节也一样。要压缩请求需要网关先支持请求解压。响应同样不压缩，发 `Accept-Encoding: gzip, br` 也不会改变响应头。
 
@@ -98,7 +111,7 @@ magpie 会按需安装 Bun、插件的运行时依赖和它的 pi 运行时。�
 pi -e ./index.ts
 ```
 
-用 `/login` 登录 `portkey-bedrock`，或导出 `apiKeyEnv` 指定的环境变量。同一会话只启用一份本 provider。
+用 `/login` 登录 `portkey-bedrock`：pi 会问同样的三个字段。同一会话只启用一份本 provider。
 
 ## OpenCode 插件 vs pi 扩展
 
@@ -124,7 +137,7 @@ MAGPIE_SOURCE_DIR=/tmp/magpie bun test test/magpie.test.ts
 
 它会在临时配置目录里用 Bun 启动 magpie 真实的 `internal/plugin/host.js`，并经 pi 桥发送 Anthropic 请求。没有 `MAGPIE_SOURCE_DIR` 时该集成测试跳过。自动化测试不访问真实的 Portkey。
 
-`npm publish` 产出的安装包只含 provider、公共默认、目录和文档；依赖、测试和本地覆盖被排除。
+`npm publish` 产出的安装包只含 provider、目录和文档；依赖、测试和本地覆盖被排除。
 
 ## 上架
 

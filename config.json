@@ -1,5 +1,0 @@
-{
-  "baseUrl": "https://api.portkey.ai/v1",
-  "provider": "aws-bedrock",
-  "headers": {}
-}

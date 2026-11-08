@@ -18,10 +18,12 @@ import {
   type AssistantMessageEventStream,
   getCurrentSystemPrompt,
   getCurrentTools,
+  type OAuthLoginCallbacks,
   type TranscriptContext,
   type ImageContent,
   type Message,
   type Model,
+  type ProviderHeaders,
   type SimpleStreamOptions,
   type StopReason,
   type TextContent,
@@ -29,6 +31,7 @@ import {
   type Tool,
   type ToolCall,
   type ToolResultMessage,
+  ToolCallArgumentsStream,
 } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
@@ -38,16 +41,88 @@ import { fileURLToPath } from "node:url";
 const PROVIDER_ID = "portkey-bedrock";
 const API_ID = "portkey-bedrock-ai-sdk" as Api;
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
-const LOCAL_CONFIG_PATH = join(EXTENSION_DIR, "config.local.json");
-const CONFIG_PATH = existsSync(LOCAL_CONFIG_PATH) ? LOCAL_CONFIG_PATH : join(EXTENSION_DIR, "config.json");
+// Optional and advanced: settings shared by every account (see readConfig).
+const CONFIG_PATH = join(EXTENSION_DIR, "config.local.json");
 const MODELS_PATH = join(EXTENSION_DIR, "models.json");
+
+// Every request goes to its own account's gateway, so the provider has no
+// endpoint of its own. pi still wants one to register with; this one is never
+// meant to be contacted — `.invalid` (RFC 2606) resolves nowhere, and a
+// request reaching streamSimple without an account gateway is refused before
+// its key could be sent anywhere else.
+const UNROUTED_BASE_URL = "https://account-gateway.invalid/v1";
+
+// A signed-in account carries its own gateway routing next to its key. The
+// values live in the credential (magpie's plugin-auth.json, never tracked
+// files) and reach each request as `options.env`, where pi resolves the
+// `$VAR` header templates below per account. The base URL rides along as a
+// courier header that streamSimple strips before calling the SDK.
+const BASE_URL_ENV = "PORTKEY_BASE_URL";
+const PROVIDER_ENV = "PORTKEY_PROVIDER";
+const BASE_URL_HEADER = "x-portkey-account-base-url";
+const FAR_FUTURE = 4_102_444_800_000; // 2100-01-01: no refresh is ever due.
+
+// A login form's answers: what magpie's sign-in dialog asked, one field at a time.
+export interface PortkeyAccountForm {
+  baseUrl: string;
+  provider: string;
+  apiKey: string;
+  /** The name magpie lists the account under: the user's alias, else one derived from the key. */
+  name: string;
+}
+
+// The account name when the user gives no alias: enough of the key to tell
+// accounts apart at a glance without showing it. Portkey keys often share a
+// prefix, so both ends are kept — a prefix alone would give two accounts the
+// same name, and magpie takes two sign-ins of one name for one account.
+export function keyName(apiKey: string): string {
+  if (apiKey.length <= 8) return "API key";
+  return `API key ${apiKey.slice(0, 4)}…${apiKey.slice(-4)}`;
+}
+
+// Decodes an account's credential back into the form that created it.
+export function accountFormOf(credential: unknown): PortkeyAccountForm | undefined {
+  const record = credential && typeof credential === "object" ? (credential as Record<string, unknown>) : undefined;
+  if (!record) return undefined;
+  const env = record.env && typeof record.env === "object" ? (record.env as Record<string, string>) : undefined;
+  const key = typeof record.access === "string" && record.access ? record.access : undefined;
+  const baseUrl = env?.[BASE_URL_ENV];
+  const provider = env?.[PROVIDER_ENV];
+  if (!key || !baseUrl || !provider) return undefined;
+  const name = typeof record.accountId === "string" && record.accountId ? record.accountId : keyName(key);
+  return { baseUrl, provider, apiKey: key, name };
+}
+
+// OAuthCredentials keeps `access` (the key magpie sends as Bearer) and any
+// extra fields; `env` rides the credential so pi resolves the header
+// templates with it on every request of this account. `accountId` is what
+// magpie names the account by in its lists and sign-in notices — and also
+// how it recognises a sign-in to an account it already has: signing in
+// again under the same name updates that account instead of adding one.
+function formToCredentials(form: PortkeyAccountForm) {
+  return {
+    access: form.apiKey,
+    refresh: form.apiKey,
+    expires: FAR_FUTURE,
+    accountId: form.name,
+    env: { [BASE_URL_ENV]: form.baseUrl, [PROVIDER_ENV]: form.provider },
+  };
+}
 
 // Anthropic models on Bedrock only cache at explicit checkpoints. Without these
 // markers nothing is ever written to the cache, so every request pays full
 // input price on the entire prompt. Bedrock allows 4 checkpoints; we use 2.
-const BEDROCK_CACHE_POINT = {
-  bedrock: { cachePoint: { type: "default" as const } },
-};
+type CacheRetention = SimpleStreamOptions["cacheRetention"];
+type CachePointOptions = { bedrock: { cachePoint: { type: "default"; ttl?: "1h" } } };
+
+// Only Claude and Nova accept cachePoint blocks; other families (Llama,
+// Mistral, DeepSeek…) gain nothing from them and may reject the request.
+// "long" asks for Bedrock's one-hour TTL, as pi's native Bedrock adapter does.
+function cachePointFor(model: Model<Api>, retention: CacheRetention): CachePointOptions | undefined {
+  if (retention === "none") return undefined;
+  if (!/claude|anthropic\.|nova/i.test(`${model.id} ${model.name ?? ""}`)) return undefined;
+  return { bedrock: { cachePoint: { type: "default", ...(retention === "long" ? { ttl: "1h" as const } : {}) } } };
+}
 
 interface ModelConfig {
   id: string;
@@ -66,9 +141,6 @@ interface ModelConfig {
 }
 
 interface PortkeyConfig {
-  baseUrl: string;
-  provider?: string;
-  configId?: string;
   headers: Record<string, string>;
   models: ModelConfig[];
 }
@@ -79,7 +151,8 @@ interface StreamBlockState {
 }
 
 interface ToolBlockState extends StreamBlockState {
-  partialJson?: string;
+  /** Incremental parser for streaming tool arguments; removed when the call ends. */
+  arguments?: ToolCallArgumentsStream;
 }
 
 function readModels(value: unknown, configPath: string): ModelConfig[] {
@@ -106,7 +179,7 @@ function readHeaders(value: unknown, configPath: string): Record<string, string>
   const headers: Record<string, string> = {};
   for (const [key, headerValue] of Object.entries(value)) {
     if (/(authorization|api[-_]?key|token|secret|cookie|virtual[-_]?key)/i.test(key)) {
-      throw new Error(`${configPath}: secret header ${key} must stay in the environment or Magpie’s API-key sign-in, not tracked JSON`);
+      throw new Error(`${configPath}: secret header ${key} must stay in magpie's sign-in, not in config JSON`);
     }
     if (typeof headerValue !== "string") {
       throw new Error(`${configPath}: headers.${key} must be a string`);
@@ -124,8 +197,13 @@ function readJsonFile(path: string): unknown {
   }
 }
 
+// The optional config.local.json holds settings shared by every account, for
+// gateways that want them: `configId` (sent as x-portkey-config) and extra
+// non-secret `headers`. Gateway and route are not among them — each account
+// brings its own from its sign-in — so `baseUrl` and `provider` left in the
+// file by earlier versions are ignored. No file means no shared settings.
 export function readConfig(configPath = CONFIG_PATH, modelsPath = MODELS_PATH): PortkeyConfig {
-  const value = readJsonFile(configPath);
+  const value = existsSync(configPath) ? readJsonFile(configPath) : {};
 
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${configPath}: root value must be an object`);
@@ -134,30 +212,41 @@ export function readConfig(configPath = CONFIG_PATH, modelsPath = MODELS_PATH): 
   const raw = value as Record<string, unknown>;
   for (const forbidden of ["apiKey", "api_key", "anthropicApiKey", "authToken", "virtualKey"]) {
     if (forbidden in raw) {
-      throw new Error(`${configPath}: ${forbidden} is a secret and must stay in Magpie's API-key sign-in, not in config JSON`);
+      throw new Error(`${configPath}: ${forbidden} is a secret and must stay in magpie's sign-in, not in config JSON`);
     }
-  }
-  if (typeof raw.baseUrl !== "string" || raw.baseUrl.length === 0) {
-    throw new Error(`${configPath}: baseUrl must be a non-empty string`);
-  }
-  if (raw.provider !== undefined && typeof raw.provider !== "string") {
-    throw new Error(`${configPath}: provider must be a string`);
   }
   if (raw.configId !== undefined && typeof raw.configId !== "string") {
     throw new Error(`${configPath}: configId must be a string`);
   }
 
   const headers = readHeaders(raw.headers, configPath);
-  if (raw.provider) headers["x-portkey-provider"] = raw.provider;
+  // Routing is per account: each signed-in account's base URL and provider
+  // slug come from its sign-in form, carried in the credential's env, and pi
+  // resolves these `$VAR` templates from it on every request.
+  headers["x-portkey-provider"] = `$${PROVIDER_ENV}`;
+  headers[BASE_URL_HEADER] = `$${BASE_URL_ENV}`;
   if (raw.configId) headers["x-portkey-config"] = raw.configId;
-
   return {
-    baseUrl: raw.baseUrl,
-    provider: raw.provider,
-    configId: raw.configId,
     headers,
     models: readModels(readJsonFile(modelsPath), modelsPath),
   };
+}
+
+// Resolves `$VAR` header templates against an account's env map, as pi's
+// provider layer does. A header whose template the env cannot answer is
+// left out rather than sent as its own `$VAR` text.
+function resolveTemplateHeaders(headers: Record<string, string>, env: Record<string, string> | undefined): Record<string, string> {
+  const resolved: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    let missing = false;
+    const text = value.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (_whole, name: string) => {
+      const found = env?.[name];
+      if (!found) missing = true;
+      return found ?? "";
+    });
+    if (!missing) resolved[key] = text;
+  }
+  return resolved;
 }
 
 function providerHeaders(
@@ -168,6 +257,17 @@ function providerHeaders(
     ...configuredHeaders,
     "x-portkey-api-key": portkeyApiKey,
   };
+}
+
+// Header lookup that tolerates case differences between the layer that set
+// it and the one that reads it.
+function firstHeader(headers: ProviderHeaders | Record<string, string> | undefined, name: string): string | undefined {
+  if (!headers) return undefined;
+  const lower = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === lower && typeof value === "string" && value) return value;
+  }
+  return undefined;
 }
 
 function convertUserContent(content: string | Array<TextContent | ImageContent>): string | Array<TextPart | FilePart> {
@@ -208,7 +308,7 @@ function convertToolResultContent(message: ToolResultMessage) {
   };
 }
 
-function convertMessages(messages: Message[]): ModelMessage[] {
+function convertMessages(messages: Message[], cachePoint?: CachePointOptions): ModelMessage[] {
   const converted: ModelMessage[] = [];
 
   for (const message of messages) {
@@ -281,7 +381,7 @@ function convertMessages(messages: Message[]): ModelMessage[] {
   // Checkpoint the end of the conversation so the next turn reads this prefix
   // back instead of re-paying for it. The marker rolls forward every turn.
   const last = converted[converted.length - 1];
-  if (last) last.providerOptions = BEDROCK_CACHE_POINT;
+  if (last && cachePoint) last.providerOptions = cachePoint;
 
   return converted;
 }
@@ -294,7 +394,8 @@ function convertTools(tools: Tool[] | undefined): ToolSet | undefined {
     converted[tool.name] = {
       description: tool.description,
       inputSchema: jsonSchema(tool.parameters),
-      outputSchema: jsonSchema({}),
+      // No outputSchema: Bedrock's toolSpec has no output field, so an
+      // empty schema here only adds conversion work per request.
     };
   }
   return converted;
@@ -473,7 +574,7 @@ function streamPortkeyAws(
     const ensureToolBlock = (id: string, name: string): ToolBlockState => {
       const existing = toolBlocks.get(id);
       if (existing) return existing;
-      const state = { contentIndex: output.content.length, partialJson: "", ended: false };
+      const state = { contentIndex: output.content.length, arguments: new ToolCallArgumentsStream(), ended: false };
       output.content.push({ type: "toolCall", id, name, arguments: {} });
       toolBlocks.set(id, state);
       stream.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
@@ -482,17 +583,34 @@ function streamPortkeyAws(
 
     try {
       const portkeyApiKey = options?.apiKey;
-      if (!portkeyApiKey) throw new Error("The configured Portkey API key environment variable is not set");
+      if (!portkeyApiKey) throw new Error("portkey-bedrock: no account is signed in (Providers → Portkey Bedrock → sign in)");
+
+      // Per-account routing. Pi resolves the provider headers' `$VAR`
+      // templates from the account's credential env and passes the result
+      // here as options.headers. The base-URL courier among them picks the
+      // account's gateway and is never sent on.
+      const env = options?.env;
+      const accountBaseUrl = firstHeader(options?.headers, BASE_URL_HEADER) ?? env?.[BASE_URL_ENV];
+      if (!accountBaseUrl) {
+        throw new Error("portkey-bedrock: this account carries no gateway — sign it out and sign in again (Providers → Portkey Bedrock)");
+      }
+      const requestHeaders = Object.fromEntries(
+        Object.entries(options?.headers ?? {}).filter(
+          (entry): entry is [string, string] => typeof entry[1] === "string" && entry[0].toLowerCase() !== BASE_URL_HEADER,
+        ),
+      );
+      const configured = resolveTemplateHeaders(configuredHeaders, env);
+      delete configured[BASE_URL_HEADER];
 
       const send = options?.fetch ?? globalThis.fetch;
       const signal = options?.timeoutMs
         ? AbortSignal.any([...(options.signal ? [options.signal] : []), AbortSignal.timeout(options.timeoutMs)])
         : options?.signal;
       const bedrock = createAmazonBedrock({
-        baseURL: model.baseUrl,
+        baseURL: accountBaseUrl,
         // Portkey requires both Bearer authentication and its own key header.
         apiKey: portkeyApiKey,
-        headers: providerHeaders(portkeyApiKey, configuredHeaders),
+        headers: providerHeaders(portkeyApiKey, configured),
         fetch: async (url, init) => {
           if (options?.onPayload && typeof init?.body === "string") {
             const payload: unknown = JSON.parse(init.body);
@@ -510,6 +628,7 @@ function streamPortkeyAws(
 
       const systemPrompt = getCurrentSystemPrompt(context.messages);
       const reasoningOptions = bedrockReasoningOptions(model, options?.reasoning);
+      const cachePoint = cachePointFor(model, options?.cacheRetention);
       const result = streamText({
         model: bedrock(model.id as never),
         // Passed as a SystemModelMessage rather than a plain string so it can
@@ -519,17 +638,17 @@ function streamPortkeyAws(
           ? {
               role: "system",
               content: systemPrompt,
-              providerOptions: BEDROCK_CACHE_POINT,
+              ...(cachePoint ? { providerOptions: cachePoint } : {}),
             }
           : undefined,
-        messages: convertMessages(context.messages),
+        messages: convertMessages(context.messages, cachePoint),
         tools: convertTools(getCurrentTools(context.messages)),
         maxOutputTokens: options?.maxTokens ?? model.maxTokens,
         reasoning: reasoningOptions ? undefined : mapReasoning(options?.reasoning, model.reasoning),
         providerOptions: reasoningOptions,
         temperature: model.reasoning && options?.reasoning ? undefined : options?.temperature,
         toolChoice: options?.toolChoice,
-        headers: Object.fromEntries(Object.entries(options?.headers ?? {}).filter((entry): entry is [string, string] => entry[1] !== null)),
+        headers: requestHeaders,
         includeRawChunks: !!options?.onProviderStreamEvent,
         abortSignal: signal,
         maxRetries: 0,
@@ -605,15 +724,14 @@ function streamPortkeyAws(
             break;
           case "tool-input-delta": {
             const state = toolBlocks.get(part.id);
-            if (!state) break;
-            state.partialJson = (state.partialJson || "") + part.delta;
+            if (!state?.arguments) break;
             const block = output.content[state.contentIndex];
             if (block.type !== "toolCall") break;
-            try {
-              block.arguments = JSON.parse(state.partialJson);
-            } catch {
-              // Keep the last complete arguments while JSON is still streaming.
-            }
+            // Linear incremental parse: the naive way re-parses the whole
+            // accumulated JSON on every delta, quadratic on large arguments.
+            // append() returns the partial arguments, a fresh object only
+            // when they actually changed.
+            block.arguments = state.arguments.append(part.delta);
             stream.push({
               type: "toolcall_delta",
               contentIndex: state.contentIndex,
@@ -629,7 +747,7 @@ function streamPortkeyAws(
             const block = output.content[state.contentIndex];
             if (block.type !== "toolCall") break;
             block.arguments = parseToolInput(part.input);
-            delete state.partialJson;
+            delete state.arguments;
             stream.push({
               type: "toolcall_end",
               contentIndex: state.contentIndex,
@@ -694,6 +812,15 @@ export interface GatewayModelContext {
   signal: AbortSignal;
 }
 
+// Model-level headers must never carry `$VAR` templates: pi resolves them
+// in getAuth() without the account's credential env in scope and throws on
+// the missing variable. Templates stay at the provider level only, where
+// the OAuth adapter resolves them against credential.env per request.
+function modelHeaders(headers: Record<string, string>): Record<string, string> | undefined {
+  const plain = Object.fromEntries(Object.entries(headers).filter(([, value]) => !value.includes("$")));
+  return Object.keys(plain).length > 0 ? plain : undefined;
+}
+
 function toProviderModels(models: ModelConfig[], headers: Record<string, string>): ProviderModelConfig[] {
   return models.map((model) => ({
     id: model.id,
@@ -709,7 +836,7 @@ function toProviderModels(models: ModelConfig[], headers: Record<string, string>
     },
     contextWindow: model.contextWindow ?? 200_000,
     maxTokens: model.maxTokens ?? 64_000,
-    headers,
+    headers: modelHeaders(headers),
   }));
 }
 
@@ -749,25 +876,25 @@ export async function discoverGatewayModels(
   context: GatewayModelContext,
   send: typeof fetch = globalThis.fetch,
 ): Promise<ProviderModelConfig[]> {
-  if (!context.allowNetwork || context.signal.aborted) return toProviderModels(config.models, config.headers);
-  const credential = context.credential;
-  const key = credential?.type === "api_key"
-    ? (credential.key || Object.values(credential.env ?? {})[0])
-    : undefined;
-  if (!key) throw new Error("portkey-bedrock: no API key available to list models with");
+  const catalog = () => toProviderModels(config.models, config.headers);
+  if (!context.allowNetwork || context.signal.aborted) return catalog();
+  const account = accountFormOf(context.credential);
+  if (!account) throw new Error("portkey-bedrock: the signed-in account carries no gateway to list models from");
 
-  const base = (context.baseUrl || config.baseUrl).replace(/\/+$/, "");
+  // The account's own gateway, route and key.
+  const base = account.baseUrl.replace(/\/+$/, "");
+  const headers = resolveTemplateHeaders(config.headers, {
+    [BASE_URL_ENV]: account.baseUrl,
+    [PROVIDER_ENV]: account.provider,
+  });
+  delete headers[BASE_URL_HEADER];
   const res = await send(`${base}/models`, {
-    headers: {
-      ...config.headers,
-      authorization: `Bearer ${key}`,
-      "x-portkey-api-key": key,
-    },
+    headers: { ...headers, authorization: `Bearer ${account.apiKey}`, "x-portkey-api-key": account.apiKey },
     signal: context.signal,
   });
   if (!res.ok) {
     // Gateways that don't expose a model list are fine: keep the catalog quietly.
-    if (res.status === 403 || res.status === 404) return toProviderModels(config.models, config.headers);
+    if (res.status === 403 || res.status === 404) return catalog();
     throw new Error(`portkey-bedrock: GET ${base}/models answered ${res.status}`);
   }
 
@@ -775,7 +902,7 @@ export async function discoverGatewayModels(
   const entries = Array.isArray(body?.data) ? body.data : Array.isArray(body) ? body : [];
   if (!entries.length) throw new Error(`portkey-bedrock: GET ${base}/models returned no models`);
 
-  const merged = toProviderModels(config.models, config.headers);
+  const merged = catalog();
   const known = new Set(merged.map((model) => model.id));
   for (const entry of entries) {
     const id = typeof entry === "string" ? entry : entry?.id;
@@ -785,10 +912,49 @@ export async function discoverGatewayModels(
       id,
       name: (typeof entry === "object" && entry.name) || id,
       ...discoveredModelDefaults(id),
-      headers: config.headers,
+      headers: modelHeaders(config.headers),
     });
   }
   return merged;
+}
+
+// The sign-in form magpie renders in its dialog: each onPrompt is one GUI
+// input, asked and answered in turn; no browser, no extra confirmation — the
+// last answer saves the account. Three fields route the account; the fourth,
+// an optional name, only labels it in magpie's lists (empty: part of the key).
+//
+// Placeholders are always Portkey's public defaults, never another account's
+// values. An empty answer means the default the placeholder shows.
+//
+// magpie's bridge restarts a login that has already finished when the front
+// end asks the method again, and the front end does ask again right after the
+// last answer, before it authorizes. A login that simply returned would be
+// restarted and the dialog would loop back to the first field. So after the
+// last answer the login announces progress — the bridge wakes the waiting
+// round on any notice, and with no question and no URL pending that round
+// reports the form done — and stays in flight a moment longer. The front
+// end's next round then finds the login still running and waits for it
+// instead of restarting it, and authorize collects the result. No state is
+// kept between sign-ins.
+const FINISH_HOLD_MS = 1_000;
+const DEFAULT_BASE_URL = "https://api.portkey.ai/v1";
+const DEFAULT_PROVIDER = "aws-bedrock";
+
+async function portkeyLoginForm(callbacks: OAuthLoginCallbacks): Promise<PortkeyAccountForm> {
+  const ask = async (message: string, placeholder: string) =>
+    (await callbacks.onPrompt({ message, placeholder })).trim();
+
+  const baseUrl = (await ask("Portkey gateway base URL", DEFAULT_BASE_URL)) || DEFAULT_BASE_URL;
+  const provider = (await ask("Portkey provider slug (x-portkey-provider)", DEFAULT_PROVIDER)) || DEFAULT_PROVIDER;
+  const apiKey = await ask("Portkey API key", "pk-…");
+  if (!apiKey) throw new Error("A Portkey API key is required");
+  if (!/^https?:\/\/\S+$/i.test(baseUrl)) throw new Error(`The base URL must start with http:// or https://, not ${baseUrl}`);
+  const derived = keyName(apiKey);
+  const name = (await ask("Account name (optional, leave empty to use part of the key)", derived)) || derived;
+
+  callbacks.onProgress?.("Saving the Portkey account…");
+  await new Promise((resolve) => setTimeout(resolve, FINISH_HOLD_MS));
+  return { baseUrl, provider, apiKey, name };
 }
 
 export default function portkeyAwsExtension(pi: ExtensionAPI): void {
@@ -797,13 +963,27 @@ export default function portkeyAwsExtension(pi: ExtensionAPI): void {
 
   pi.registerProvider(PROVIDER_ID, {
     name: "Portkey Bedrock",
-    baseUrl: config.baseUrl,
+    baseUrl: UNROUTED_BASE_URL,
     api: API_ID,
     headers: config.headers,
     models,
     streamSimple: createPortkeyStream(config.headers),
     async refreshModels(context) {
       return await discoverGatewayModels(config, context);
+    },
+    oauth: {
+      name: "Portkey Bedrock gateway",
+      async login(callbacks) {
+        return formToCredentials(await portkeyLoginForm(callbacks));
+      },
+      // A Portkey key never expires on its own; nothing to renew. The far
+      // future expiry keeps pi's refresh path from ever running.
+      async refreshToken(credentials) {
+        return credentials;
+      },
+      getApiKey(credentials) {
+        return String((credentials as { access?: string }).access ?? "");
+      },
     },
   });
 }

@@ -6,13 +6,22 @@ The provider id is **`portkey-bedrock`**. Its models are available to every agen
 
 中文文档：[README.zh-CN.md](./README.zh-CN.md)
 
+> [!IMPORTANT]
+> **Upgrading from 1.2.x or earlier: sign in your accounts again.** Each account now carries its own gateway, route and name from the sign-in form; config files no longer route anything.
+>
+> 1. **Sign out every existing Portkey Bedrock account** (Providers → Portkey Bedrock). Accounts from earlier versions hold only a key and no gateway, so their requests fail with `Provider is not configured`. Nothing is sent with them, so their keys never leave your machine.
+> 2. **Sign in again through the form**: base URL, provider slug, API key and an optional name.
+> 3. **Delete `config.local.json`** beside `index.ts` if all it holds is `baseUrl` and `provider`. They are ignored now; only `configId` and extra `headers` still apply (see [Configure your gateway](#configure-your-gateway)).
+
 ## Features
 
 - Native Bedrock Converse streaming through `@ai-sdk/amazon-bedrock`.
-- Dynamic model discovery: once an account is signed in, the provider asks the gateway for its model list (`GET /v1/models`) and merges what your account actually serves into the catalog; failures keep the catalog.
-- Text, vision, streamed tool arguments and tool results, including image results and failed tools.
+- GUI sign-in form: **base URL, Portkey provider slug, API key** and an optional account name — no config editing, no browser. Every account routes through its own gateway.
+- Multi-account: each signed-in account carries its own key, gateway URL and provider route; magpie rotates, fails over and rate-limits them per account.
+- Dynamic model discovery: once an account is signed in, the provider asks that account's gateway for its model list (`GET /v1/models`) and merges what it actually serves into the catalog; failures keep the catalog.
+- Text, vision, streamed tool arguments and tool results, including image results and failed tools. Tool arguments parse incrementally — linear in stream length, not quadratic.
 - Reasoning levels, including `xhigh` and `max` where declared; signed and redacted reasoning survives replay. Thinking streams with `display: summarized`, so the first token arrives while the model reasons instead of after the whole reasoning pass.
-- Two explicit prompt-cache checkpoints (system prompt and final conversation message) — Bedrock only caches at explicit checkpoints, so this is what makes prompt caching actually work on Anthropic models.
+- Prompt-cache checkpoints gated by model family (Claude and Nova only — other Bedrock families ignore or reject `cachePoint`) with `cacheRetention` support, including Bedrock's one-hour TTL (`long`).
 - Input, output, cache-read and cache-write token accounting with catalog prices.
 - Cancellation, request timeouts, payload inspection and response hooks.
 - HTTP status and retry headers forwarded to magpie for its routing and failover logic.
@@ -31,7 +40,16 @@ git clone https://github.com/yangwudong/magpie-portkey-bedrock.git
 magpie plugin add "$PWD/magpie-portkey-bedrock"
 ```
 
-Then sign in with your **Portkey gateway API key** (`magpie plugin login portkey-bedrock`, or the Providers page). magpie stores it in `plugin-auth.json` under its configuration directory and supplies the account's key for each request. Multiple accounts are supported.
+Then sign in with your **Portkey gateway account** (the Providers page, or `magpie plugin login portkey-bedrock`). The sign-in form asks its fields one after another and saves the account after the last — no browser, nothing else to confirm:
+
+1. **Base URL** — your Portkey gateway's Bedrock-compatible base URL. Requests go to `/model/{encoded model id}/converse-stream`.
+2. **Provider slug** — the `x-portkey-provider` route for this account, such as `@your-aws-provider`.
+3. **API key** — the account's Portkey gateway key.
+4. **Account name** (optional) — what magpie lists the account as. Left empty, it is named by both ends of its key, like `API key AbCd…Yz12`; the rest of the key is never shown.
+
+Names identify accounts: signing in again under a name an account already has updates that account (new key, gateway or route) instead of adding another. Give each account its own name.
+
+An empty base URL or slug means Portkey's public default shown as the field's hint (`https://api.portkey.ai/v1`, `aws-bedrock`); the hints never show your own configuration. magpie keeps each sign-in in `plugin-auth.json` under its configuration directory. Sign in again for each further account: every account keeps its own key, gateway and provider route, and magpie's routing, failover and account limits apply per account. Requests send the selected account's key as both `Authorization: Bearer …` and `x-portkey-api-key`.
 
 Select **Providers → Portkey Bedrock**, then choose a `portkey-bedrock/…` model for your agent:
 
@@ -43,26 +61,21 @@ magpie installs Bun, the plugin's runtime dependencies and its pi runtime when n
 
 ## Configure your gateway
 
-The package ships this public default in `config.json`:
+There is nothing to configure: every account's gateway and route come from its sign-in, and the package ships no config file.
+
+Gateways that need settings shared by every account can put them in an optional `config.local.json` beside `index.ts` (ignored by git, excluded from the npm package):
 
 ```json
 {
-  "baseUrl": "https://api.portkey.ai/v1",
-  "provider": "aws-bedrock",
-  "headers": {}
+  "configId": "pc-your-config",
+  "headers": { "x-portkey-trace-id": "magpie" }
 }
 ```
 
-Create `config.local.json` beside `index.ts` to override it. That file is ignored by git and excluded from the npm package. Loading order is `config.local.json`, then `config.json`; each selects a complete configuration file. There are no environment variables — routing comes from these files, credentials come from magpie's sign-in.
+- `configId`: an `x-portkey-config` configuration id sent with every account's requests.
+- `headers`: additional non-secret gateway headers sent with every account's requests.
 
-- `baseUrl`: your Portkey gateway's Bedrock-compatible base URL. Requests go to `/model/{encoded model id}/converse-stream`.
-- `provider`: optional `x-portkey-provider` route. Set this to your configured Portkey AWS provider slug, such as `@your-aws-provider`, when using a provider integration.
-- `configId`: optional `x-portkey-config` configuration id. Use a route or configuration with AWS credentials already configured in Portkey.
-- `headers`: additional non-secret gateway headers.
-
-This matters for updates: reinstalling an npm/GitHub plugin replaces its directory, so a `config.local.json` created inside it is lost and must be recreated. If you install from a local folder (`magpie plugin add /path/to/checkout`), `config.local.json` lives in your own checkout and is never touched.
-
-Credentials belong in magpie's sign-in — never in config files. The config reader rejects API keys and secret headers embedded in JSON (`apiKey`, `virtualKey`, `authorization`, `*-api-key`, `token`, `secret`, `cookie`). Requests send the selected account's key as both `Authorization: Bearer …` and `x-portkey-api-key`. Restart the plugin after configuration changes.
+`baseUrl` and `provider` from earlier versions' files are ignored — they route nothing now. Credentials belong in magpie's sign-in, never in this file: the reader rejects API keys and secret headers (`apiKey`, `virtualKey`, `authorization`, `*-api-key`, `token`, `secret`, `cookie`). Restart the plugin after changing it.
 
 Requests are sent uncompressed. Portkey's deployed gateway reads the body as plain JSON and does not decompress: a gzip or deflate body answers `400` with `Value null at 'messages'` even at 95 bytes, on both `/model/{id}/converse-stream` and `/v1/messages`. Compressing the request needs the gateway to enable request decompression first. Responses are also sent uncompressed, and `Accept-Encoding: gzip, br` changes nothing.
 
@@ -98,7 +111,7 @@ From a local checkout:
 pi -e ./index.ts
 ```
 
-Use `/login` for `portkey-bedrock`, or export the variable named by `apiKeyEnv`. Enable only one copy of this provider per session.
+Use `/login` for `portkey-bedrock`: pi asks the same three fields. Enable only one copy of this provider per session.
 
 ## OpenCode plugin vs pi extension
 
@@ -124,7 +137,7 @@ MAGPIE_SOURCE_DIR=/tmp/magpie bun test test/magpie.test.ts
 
 This starts magpie's actual `internal/plugin/host.js` under Bun in a temporary configuration directory and sends Anthropic requests through the pi bridge. Without `MAGPIE_SOURCE_DIR`, that integration test is skipped. Live Portkey access is not part of the automated tests.
 
-`npm publish` creates an installable archive containing the provider, public defaults, catalog and documentation. Dependencies, tests and local overrides are excluded.
+`npm publish` creates an installable archive containing the provider, catalog and documentation. Dependencies, tests and local overrides are excluded.
 
 ## Marketplace
 
