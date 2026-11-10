@@ -433,6 +433,52 @@ function bedrockReasoningOptions(model: Model<Api>, level: SimpleStreamOptions["
   };
 }
 
+// Bedrock's trace.guardrail names what fired: input/output assessments keyed
+// by guardrail id, each holding policy sections (topicPolicy.topics,
+// contentPolicy.filters, wordPolicy.customWords, sensitiveInformationPolicy
+// .piiEntities, ...). Report every entry that took an action.
+function guardrailFindings(trace: unknown): string[] {
+  const guardrail = (trace as { guardrail?: Record<string, unknown> } | undefined)?.guardrail;
+  if (!guardrail || typeof guardrail !== "object") return [];
+  const findings = new Set<string>();
+  const visit = (where: string, assessment: unknown) => {
+    if (!assessment || typeof assessment !== "object") return;
+    for (const [policy, sections] of Object.entries(assessment)) {
+      if (!sections || typeof sections !== "object") continue;
+      for (const entries of Object.values(sections)) {
+        if (!Array.isArray(entries)) continue;
+        for (const entry of entries as Record<string, unknown>[]) {
+          if (!entry || typeof entry.action !== "string" || entry.action === "NONE") continue;
+          const what = [entry.name, entry.type, entry.match].filter((v) => typeof v === "string" && v).join(" ");
+          const confidence = typeof entry.confidence === "string" ? `, confidence ${entry.confidence}` : "";
+          findings.add(`${where} ${policy}${what ? ` ${what}` : ""} ${entry.action}${confidence}`);
+        }
+      }
+    }
+  };
+  for (const [id, assessment] of Object.entries((guardrail.inputAssessment ?? {}) as Record<string, unknown>)) {
+    visit(`input[${id}]`, assessment);
+  }
+  for (const [id, list] of Object.entries((guardrail.outputAssessments ?? {}) as Record<string, unknown>)) {
+    for (const assessment of Array.isArray(list) ? list : [list]) visit(`output[${id}]`, assessment);
+  }
+  return [...findings];
+}
+
+// Name the cause so a blocked response is not mistaken for a gateway outage.
+function finishErrorMessage(reason: FinishReason | undefined, raw: string | undefined, trace?: unknown): string {
+  const detail = raw ? ` (stopReason: ${raw})` : "";
+  if (reason === "content-filter") {
+    const by = raw === "guardrail_intervened" ? "a Bedrock/Portkey guardrail" : "Bedrock content filtering";
+    const fired = guardrailFindings(trace);
+    return `Response blocked by ${by}${detail}. ` +
+      (fired.length ? `Bedrock reported: ${fired.join("; ")}. ` : "") +
+      "This is a content policy decision, not a gateway failure; " +
+      "retrying the same request will likely be blocked again. Check the guardrail logs in Portkey to see which rule fired.";
+  }
+  return `Portkey returned an error finish reason${detail}`;
+}
+
 function mapFinishReason(reason: FinishReason): StopReason {
   switch (reason) {
     case "tool-calls":
@@ -496,15 +542,19 @@ function parseToolInput(input: unknown): ToolCall["arguments"] {
 
 function formatError(error: unknown): string {
   if (error instanceof Error) {
-    const apiError = error as Error & { responseBody?: unknown; statusCode?: number };
+    const apiError = error as Error & { responseBody?: unknown; statusCode?: number; type?: unknown };
     const responseBody =
       typeof apiError.responseBody === "string"
         ? apiError.responseBody
         : apiError.responseBody === undefined
           ? undefined
           : JSON.stringify(apiError.responseBody);
+    const message = apiError.message || "API request failed";
+    // Bedrock's in-stream exceptions carry their name (validationException,
+    // throttlingException, ...) as type; keep it so the cause is visible.
+    const type = typeof apiError.type === "string" && !message.startsWith(apiError.type) ? apiError.type : undefined;
     return [
-      apiError.message || "API request failed",
+      type ? `Bedrock ${type}: ${message}` : message,
       apiError.statusCode ? `(HTTP ${apiError.statusCode})` : undefined,
       responseBody,
     ]
@@ -659,6 +709,9 @@ function streamPortkeyAws(
       stream.push({ type: "start", partial: output });
 
       let finished = false;
+      let finishReason: FinishReason | undefined;
+      let rawFinishReason: string | undefined;
+      let guardrailTrace: unknown;
       for await (const part of result.stream) {
         if (part.type === "raw" && options?.onProviderStreamEvent) {
           // Observation must not interrupt the response if an observer fails.
@@ -756,9 +809,14 @@ function streamPortkeyAws(
             });
             break;
           }
+          case "finish-step":
+            guardrailTrace = (part.providerMetadata?.bedrock as { trace?: unknown } | undefined)?.trace;
+            break;
           case "finish":
             if (part.finishReason === "other") throw new Error("Portkey stream ended without a valid stop reason");
             finished = true;
+            finishReason = part.finishReason;
+            rawFinishReason = part.rawFinishReason;
             output.stopReason = mapFinishReason(part.finishReason);
             updateUsage(output, part.totalUsage, model);
             break;
@@ -776,7 +834,7 @@ function streamPortkeyAws(
       if ([...textBlocks.values(), ...reasoningBlocks.values(), ...toolBlocks.values()].some((block) => !block.ended)) {
         throw new Error("Portkey stream ended with an incomplete content block");
       }
-      if (output.stopReason === "error") throw new Error("Portkey returned an error finish reason");
+      if (output.stopReason === "error") throw new Error(finishErrorMessage(finishReason, rawFinishReason, guardrailTrace));
 
       stream.push({
         type: "done",

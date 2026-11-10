@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeContext, type Api, type Context, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import plugin, { accountFormOf, createPortkeyStream, discoverGatewayModels, keyName, readConfig } from "../index.ts";
-import { end, textEvents, wireResponse, type WireEvent } from "./wire.ts";
+import { end, textEvents, usage, wireResponse, type WireEvent } from "./wire.ts";
 
 // The catalog with no shared settings, as a fresh install has: never the
 // checkout's own config.local.json, which is the user's.
@@ -83,8 +83,24 @@ test("content-filtered finishes surface as errors, not silent stops", async () =
     events[events.length - 2] = ["messageStop", { stopReason }];
     const { message } = await ask(events);
     assert.equal(message.stopReason, "error");
-    assert.match(message.errorMessage!, /error finish reason/);
+    assert.match(message.errorMessage!, /^Response blocked by /);
+    assert.match(message.errorMessage!, new RegExp(`stopReason: ${stopReason}`));
+    assert.match(message.errorMessage!, stopReason === "guardrail_intervened" ? /guardrail/ : /content filtering/);
   }
+});
+
+test("guardrail blocks report what Bedrock says fired", async () => {
+  const trace = { guardrail: { inputAssessment: { gr1: {
+    topicPolicy: { topics: [{ name: "Finance", type: "DENY", action: "BLOCKED" }] },
+    contentPolicy: { filters: [{ type: "VIOLENCE", confidence: "HIGH", action: "BLOCKED" }, { type: "HATE", confidence: "NONE", action: "NONE" }] },
+  } } } };
+  const events = textEvents();
+  events.splice(-2, 2, ["messageStop", { stopReason: "guardrail_intervened" }], ["metadata", { usage, trace }]);
+  const { message } = await ask(events);
+  assert.equal(message.stopReason, "error");
+  assert.match(message.errorMessage!, /input\[gr1\] topicPolicy Finance DENY BLOCKED/);
+  assert.match(message.errorMessage!, /input\[gr1\] contentPolicy VIOLENCE BLOCKED, confidence HIGH/);
+  assert.doesNotMatch(message.errorMessage!, /HATE/);
 });
 
 test("Nova-style redactedContent reasoning survives streaming and replay", async () => {
@@ -250,7 +266,7 @@ test("missing key, malformed tool JSON, truncated stream and provider errors fai
   assert.equal((await ask(textEvents().slice(0, 3))).message.stopReason, "error");
   const failed = await ask([["validationException", { message: "context_length_exceeded" }]]);
   assert.equal(failed.message.stopReason, "error");
-  assert.match(failed.message.errorMessage!, /context_length_exceeded/);
+  assert.match(failed.message.errorMessage!, /^Bedrock validationException: context_length_exceeded \(HTTP 400\)/);
 });
 
 test("rejects secrets embedded in the config", () => {
