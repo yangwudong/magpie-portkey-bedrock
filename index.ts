@@ -35,6 +35,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -42,7 +43,15 @@ const PROVIDER_ID = "portkey-bedrock";
 const API_ID = "portkey-bedrock-ai-sdk" as Api;
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 // Optional and advanced: settings shared by every account (see readConfig).
-const CONFIG_PATH = join(EXTENSION_DIR, "config.local.json");
+// Kept in magpie's config folder, outside the installed package, so plugin
+// updates never take it away. The file beside index.ts, where earlier
+// versions read it, is still read when the new one does not exist.
+export const CONFIG_PATH = join(homedir(), ".config", "magpie", "portkey-bedrock", "config.json");
+const LEGACY_CONFIG_PATH = join(EXTENSION_DIR, "config.local.json");
+
+export function defaultConfigPath(path = CONFIG_PATH, legacy = LEGACY_CONFIG_PATH): string {
+  return !existsSync(path) && existsSync(legacy) ? legacy : path;
+}
 const MODELS_PATH = join(EXTENSION_DIR, "models.json");
 
 // Every request goes to its own account's gateway, so the provider has no
@@ -197,12 +206,12 @@ function readJsonFile(path: string): unknown {
   }
 }
 
-// The optional config.local.json holds settings shared by every account, for
-// gateways that want them: `configId` (sent as x-portkey-config) and extra
-// non-secret `headers`. Gateway and route are not among them — each account
+// The optional config file (CONFIG_PATH) holds settings shared by every
+// account, for gateways that want them: `configId` (sent as
+// x-portkey-config), extra non-secret `headers` and hidden `models`. Gateway and route are not among them — each account
 // brings its own from its sign-in — so `baseUrl` and `provider` left in the
 // file by earlier versions are ignored. No file means no shared settings.
-export function readConfig(configPath = CONFIG_PATH, modelsPath = MODELS_PATH): PortkeyConfig {
+export function readConfig(configPath = defaultConfigPath(), modelsPath = MODELS_PATH): PortkeyConfig {
   const value = existsSync(configPath) ? readJsonFile(configPath) : {};
 
   if (!value || typeof value !== "object" || Array.isArray(value)) {

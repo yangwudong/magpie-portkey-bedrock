@@ -5,11 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeContext, type Api, type Context, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai";
-import plugin, { accountFormOf, createPortkeyStream, discoverGatewayModels, keyName, readConfig } from "../index.ts";
+import plugin, { accountFormOf, CONFIG_PATH, createPortkeyStream, defaultConfigPath, discoverGatewayModels, keyName, readConfig } from "../index.ts";
 import { end, textEvents, usage, wireResponse, type WireEvent } from "./wire.ts";
 
 // The catalog with no shared settings, as a fresh install has: never the
-// checkout's own config.local.json, which is the user's.
+// user's own config file.
 const MODELS = fileURLToPath(new URL("../models.json", import.meta.url));
 const noSettings = () => readConfig(join(tmpdir(), "portkey-no-such-config.json"), MODELS);
 
@@ -404,6 +404,20 @@ test("model discovery fails closed and keeps the catalog", async () => {
       /carries no gateway/,
     );
   }
+});
+
+test("the config lives in magpie's folder; the old file beside index.ts is read until it exists", () => {
+  assert.ok(CONFIG_PATH.endsWith(join(".config", "magpie", "portkey-bedrock", "config.json")));
+  const temp = mkdtempSync(join(tmpdir(), "portkey-path-"));
+  try {
+    const path = join(temp, "config.json");
+    const legacy = join(temp, "config.local.json");
+    assert.equal(defaultConfigPath(path, legacy), path);
+    writeFileSync(legacy, "{}");
+    assert.equal(defaultConfigPath(path, legacy), legacy);
+    writeFileSync(path, "{}");
+    assert.equal(defaultConfigPath(path, legacy), path);
+  } finally { rmSync(temp, { recursive: true }); }
 });
 
 test("config validation covers headers, models and secret fields", () => {

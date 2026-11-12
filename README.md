@@ -63,7 +63,7 @@ magpie installs Bun, the plugin's runtime dependencies and its pi runtime when n
 
 There is nothing to configure: every account's gateway and route come from its sign-in, and the package ships no config file.
 
-Gateways that need settings shared by every account can put them in an optional `config.local.json` beside `index.ts` (ignored by git, excluded from the npm package):
+Gateways that need settings shared by every account can put them in an optional `~/.config/magpie/portkey-bedrock/config.json`. It lives outside the installed plugin, so updates leave it alone. A `config.local.json` beside `index.ts` from earlier versions is still read while the new file does not exist; move it over, since plugin updates may remove it:
 
 ```json
 {

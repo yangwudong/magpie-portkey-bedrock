@@ -41,7 +41,7 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
   await once(upstream, "listening");
   const port = (upstream.address() as { port: number }).port;
   // Routing comes from each account's sign-in form, so the test needs no
-  // config file — and never touches the checkout's own config.local.json.
+  // config file — and never touches the user's own config file.
   writeFileSync(join(temp, "auth.json"), "{}");
   const child = spawn(process.env.BUN_BIN ?? "bun", [join(source!, "internal/plugin/host.js")], {
     cwd: temp,

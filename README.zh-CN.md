@@ -63,7 +63,7 @@ magpie 会按需安装 Bun、插件的运行时依赖和它的 pi 运行时。�
 
 无需任何配置：每个账号的网关和路由都来自它的登录表单，包里也不带配置文件。
 
-如果网关需要所有账号共用的设置，可以写进 `index.ts` 旁可选的 `config.local.json`（被 git 忽略、不进 npm 包）：
+如果网关需要所有账号共用的设置，可以写进可选的 `~/.config/magpie/portkey-bedrock/config.json`。它在已安装插件目录之外，更新插件不会动它。旧版本放在 `index.ts` 旁的 `config.local.json` 在新文件不存在时仍会读取；请把它挪过去，因为更新插件可能会删掉它：
 
 ```json
 {
