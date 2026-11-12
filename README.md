@@ -112,7 +112,7 @@ From a local checkout:
 pi -e ./index.ts
 ```
 
-Use `/login` for `portkey-bedrock`: pi asks the same three fields. Enable only one copy of this provider per session.
+Use `/login` for `portkey-bedrock`: pi asks the same four fields. Enable only one copy of this provider per session.
 
 ## OpenCode plugin vs pi extension
 
@@ -120,7 +120,7 @@ This package is a **pi extension**: the real `@ai-sdk/amazon-bedrock` SDK runs h
 
 ## Development and verification
 
-Tested with pi 1.2.0 and magpie's Bun plugin host.
+Tested with pi 1.5.2 and magpie's Bun plugin host.
 
 ```sh
 bun install --ignore-scripts

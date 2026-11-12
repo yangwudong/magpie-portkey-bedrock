@@ -112,7 +112,7 @@ magpie 会按需安装 Bun、插件的运行时依赖和它的 pi 运行时。�
 pi -e ./index.ts
 ```
 
-用 `/login` 登录 `portkey-bedrock`：pi 会问同样的三个字段。同一会话只启用一份本 provider。
+用 `/login` 登录 `portkey-bedrock`：pi 会问同样的四个字段。同一会话只启用一份本 provider。
 
 ## OpenCode 插件 vs pi 扩展
 
@@ -120,7 +120,7 @@ pi -e ./index.ts
 
 ## 开发与验证
 
-在 pi 1.2.0 和 magpie 的 Bun 插件宿主上测试。
+在 pi 1.5.2 和 magpie 的 Bun 插件宿主上测试。
 
 ```sh
 bun install --ignore-scripts

@@ -46,7 +46,10 @@ const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 // Kept in magpie's config folder, outside the installed package, so plugin
 // updates never take it away. The file beside index.ts, where earlier
 // versions read it, is still read when the new one does not exist.
-export const CONFIG_PATH = join(homedir(), ".config", "magpie", "portkey-bedrock", "config.json");
+// PORTKEY_BEDROCK_CONFIG points elsewhere (tests use it to stay off the
+// user's own file).
+export const CONFIG_PATH = process.env.PORTKEY_BEDROCK_CONFIG ||
+  join(homedir(), ".config", "magpie", "portkey-bedrock", "config.json");
 const LEGACY_CONFIG_PATH = join(EXTENSION_DIR, "config.local.json");
 
 export function defaultConfigPath(path = CONFIG_PATH, legacy = LEGACY_CONFIG_PATH): string {
@@ -238,13 +241,13 @@ export function readConfig(configPath = defaultConfigPath(), modelsPath = MODELS
   // Extra models the gateway serves but its /models list hides, callable by
   // id. They join the catalog (overriding an entry of the same id) and are
   // registered whether or not discovery reports them.
-  const models = readModels(readJsonFile(modelsPath), modelsPath);
-  if (raw.models !== undefined) {
-    const extra = Array.isArray(raw.models) && raw.models.length === 0 ? [] : readModels(raw.models, configPath);
-    const ids = new Set(extra.map((model) => model.id));
-    models.splice(0, models.length, ...models.filter((model) => !ids.has(model.id)), ...extra);
-  }
-  return { headers, models };
+  const catalog = readModels(readJsonFile(modelsPath), modelsPath);
+  // An empty list adds nothing; the catalog alone must be non-empty.
+  const extra = raw.models === undefined || (Array.isArray(raw.models) && raw.models.length === 0)
+    ? []
+    : readModels(raw.models, configPath);
+  const ids = new Set(extra.map((model) => model.id));
+  return { headers, models: [...catalog.filter((model) => !ids.has(model.id)), ...extra] };
 }
 
 // Resolves `$VAR` header templates against an account's env map, as pi's
@@ -646,6 +649,9 @@ function streamPortkeyAws(
       return state;
     };
 
+    // A deadline of its own, so a timeout reads as one rather than as an
+    // abort the user never asked for or an opaque stream failure.
+    const timeout = options?.timeoutMs ? AbortSignal.timeout(options.timeoutMs) : undefined;
     try {
       const portkeyApiKey = options?.apiKey;
       if (!portkeyApiKey) throw new Error("portkey-bedrock: no account is signed in (Providers → Portkey Bedrock → sign in)");
@@ -668,8 +674,8 @@ function streamPortkeyAws(
       delete configured[BASE_URL_HEADER];
 
       const send = options?.fetch ?? globalThis.fetch;
-      const signal = options?.timeoutMs
-        ? AbortSignal.any([...(options.signal ? [options.signal] : []), AbortSignal.timeout(options.timeoutMs)])
+      const signal = timeout
+        ? AbortSignal.any([...(options?.signal ? [options.signal] : []), timeout])
         : options?.signal;
       const bedrock = createAmazonBedrock({
         baseURL: accountBaseUrl,
@@ -845,6 +851,7 @@ function streamPortkeyAws(
       }
 
       if (options?.signal?.aborted) throw new Error("Request was aborted");
+      if (timeout?.aborted) throw timeout.reason;
       if (!finished) throw new Error("Portkey stream ended before completion");
       if ([...textBlocks.values(), ...reasoningBlocks.values(), ...toolBlocks.values()].some((block) => !block.ended)) {
         throw new Error("Portkey stream ended with an incomplete content block");
@@ -859,7 +866,9 @@ function streamPortkeyAws(
       stream.end();
     } catch (error) {
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-      output.errorMessage = formatError(error);
+      output.errorMessage = timeout?.aborted && !options?.signal?.aborted
+        ? `portkey-bedrock: the request timed out after ${options!.timeoutMs} ms`
+        : formatError(error);
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();
     }
@@ -894,23 +903,28 @@ function modelHeaders(headers: Record<string, string>): Record<string, string> |
   return Object.keys(plain).length > 0 ? plain : undefined;
 }
 
-function toProviderModels(models: ModelConfig[], headers: Record<string, string>): ProviderModelConfig[] {
-  return models.map((model) => ({
-    id: model.id,
-    name: model.name || model.id,
-    reasoning: model.reasoning ?? true,
-    thinkingLevelMap: model.thinkingLevelMap,
-    input: model.input ?? (["text", "image"] as Array<"text" | "image">),
-    cost: {
-      input: model.cost?.input ?? 0,
-      output: model.cost?.output ?? 0,
-      cacheRead: model.cost?.cacheRead ?? 0,
-      cacheWrite: model.cost?.cacheWrite ?? 0,
-    },
-    contextWindow: model.contextWindow ?? 200_000,
-    maxTokens: model.maxTokens ?? 64_000,
-    headers: modelHeaders(headers),
-  }));
+// Fields an entry leaves out take the same per-family defaults a discovered
+// id gets, so a bare id means the same thing in a config file as on /models.
+export function toProviderModels(models: ModelConfig[], headers: Record<string, string>): ProviderModelConfig[] {
+  return models.map((model) => {
+    const defaults = discoveredModelDefaults(model.id);
+    return {
+      id: model.id,
+      name: model.name || model.id,
+      reasoning: model.reasoning ?? defaults.reasoning,
+      thinkingLevelMap: model.thinkingLevelMap,
+      input: model.input ?? defaults.input,
+      cost: {
+        input: model.cost?.input ?? 0,
+        output: model.cost?.output ?? 0,
+        cacheRead: model.cost?.cacheRead ?? 0,
+        cacheWrite: model.cost?.cacheWrite ?? 0,
+      },
+      contextWindow: model.contextWindow ?? defaults.contextWindow,
+      maxTokens: model.maxTokens ?? defaults.maxTokens,
+      headers: modelHeaders(headers),
+    };
+  });
 }
 
 // The chat variant of the exported union; the package keeps the union member unexported.

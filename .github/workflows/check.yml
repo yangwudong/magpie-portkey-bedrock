@@ -19,7 +19,7 @@ jobs:
           cache: npm
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: '1.4.3'
+          bun-version: '1.4.4'
       - uses: actions/checkout@v6
         with:
           repository: yetone/magpie

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeContext, type Api, type Context, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai";
-import plugin, { accountFormOf, CONFIG_PATH, createPortkeyStream, defaultConfigPath, discoverGatewayModels, keyName, readConfig } from "../index.ts";
+import plugin, { accountFormOf, CONFIG_PATH, createPortkeyStream, defaultConfigPath, discoverGatewayModels, keyName, readConfig, toProviderModels } from "../index.ts";
 import { end, textEvents, usage, wireResponse, type WireEvent } from "./wire.ts";
 
 // The catalog with no shared settings, as a fresh install has: never the
@@ -247,6 +247,35 @@ test("HTTP refusal reaches onResponse for Magpie failover without retries", asyn
   assert.deepEqual(response, { status: 429, headers: { "content-type": "application/json", "retry-after": "7" } });
 });
 
+test("a timeout is reported as one, not as a user abort", async () => {
+  const result = await ask([], context, { timeoutMs: 20, fetch: async (_url, init) => {
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal!.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+    });
+  } });
+  assert.equal(result.message.stopReason, "error");
+  assert.match(result.message.errorMessage!, /timed out after 20 ms/);
+});
+
+test("bare ids take per-family defaults", () => {
+  const temp = mkdtempSync(join(tmpdir(), "portkey-bare-"));
+  try {
+    const path = join(temp, "config.json");
+    writeFileSync(path, JSON.stringify({ models: ["us.anthropic.claude-x-1", "meta.llama-x-1"] }));
+    const config = readConfig(path, MODELS);
+    const models: any[] = toProviderModels(config.models, config.headers);
+    const claude = models.find((m) => m.id === "us.anthropic.claude-x-1");
+    const llama = models.find((m) => m.id === "meta.llama-x-1");
+    assert.equal(claude.contextWindow, 1_000_000);
+    assert.equal(claude.reasoning, true);
+    assert.equal(llama.reasoning, false);
+    assert.deepEqual(llama.input, ["text"]);
+    assert.equal(llama.maxTokens, 8192);
+    // Catalog entries keep what they declare.
+    assert.equal(models.find((m) => m.id === "us.anthropic.claude-haiku-4-5-20251001-v1:0").contextWindow, 200_000);
+  } finally { rmSync(temp, { recursive: true }); }
+});
+
 test("aborting a request terminates as aborted", async () => {
   const abort = new AbortController();
   const pending = ask([], context, { signal: abort.signal, fetch: async (_url, init) => {
@@ -407,7 +436,8 @@ test("model discovery fails closed and keeps the catalog", async () => {
 });
 
 test("the config lives in magpie's folder; the old file beside index.ts is read until it exists", () => {
-  assert.ok(CONFIG_PATH.endsWith(join(".config", "magpie", "portkey-bedrock", "config.json")));
+  // The preload (test/isolate-home.ts) redirects it away from the real file.
+  assert.equal(CONFIG_PATH, process.env.PORTKEY_BEDROCK_CONFIG);
   const temp = mkdtempSync(join(tmpdir(), "portkey-path-"));
   try {
     const path = join(temp, "config.json");

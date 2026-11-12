@@ -25,7 +25,7 @@ jobs:
           cache: npm
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: '1.4.3'
+          bun-version: '1.4.4'
       - run: npm ci --ignore-scripts
       - run: npm run check
       - run: npm publish
