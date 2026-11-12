@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeContext, type Api, type Context, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai";
-import plugin, { accountFormOf, CONFIG_PATH, createPortkeyStream, defaultConfigPath, discoverGatewayModels, keyName, readConfig, toProviderModels } from "../index.ts";
+import plugin, { accountFormOf, CONFIG_PATH, createPortkeyStream, defaultConfigPath, discoverGatewayModels, keyName, loadConfig, readConfig, toProviderModels } from "../index.ts";
 import { end, textEvents, usage, wireResponse, type WireEvent } from "./wire.ts";
 
 // The catalog with no shared settings, as a fresh install has: never the
@@ -447,6 +447,57 @@ test("the config lives in magpie's folder; the old file beside index.ts is read 
     assert.equal(defaultConfigPath(path, legacy), legacy);
     writeFileSync(path, "{}");
     assert.equal(defaultConfigPath(path, legacy), path);
+  } finally { rmSync(temp, { recursive: true }); }
+});
+
+test("model entries are checked field by field", () => {
+  const temp = mkdtempSync(join(tmpdir(), "portkey-fields-"));
+  try {
+    const path = join(temp, "config.json");
+    const read = (entry: unknown) => {
+      writeFileSync(path, JSON.stringify({ models: [entry] }));
+      return readConfig(path, MODELS);
+    };
+    const id = "us.anthropic.claude-x";
+    for (const [entry, error] of [
+      [{ id, contextwindow: 1 }, /\(us\.anthropic\.claude-x\): unknown field contextwindow/],
+      [{ id, name: 1 }, /name must be a string/],
+      [{ id, reasoning: "yes" }, /reasoning must be true or false/],
+      [{ id, contextWindow: "1M" }, /contextWindow must be a whole number/],
+      [{ id, maxTokens: 0 }, /maxTokens must be a whole number/],
+      [{ id, input: "image" }, /input must be a list/],
+      [{ id, input: ["text", "audio"] }, /input must be a list/],
+      [{ id, cost: 5 }, /cost must be an object/],
+      [{ id, cost: { inptu: 1 } }, /unknown cost field inptu/],
+      [{ id, cost: { input: "4" } }, /cost\.input must be a price/],
+      [{ id, cost: { input: -1 } }, /cost\.input must be a price/],
+      [{ id, thinkingLevelMap: [] }, /thinkingLevelMap must be an object/],
+      [{ id, thinkingLevelMap: { ultra: "max" } }, /thinkingLevelMap\.ultra is not a thinking level/],
+      [{ id, thinkingLevelMap: { max: 1 } }, /thinkingLevelMap\.max must be a level name or null/],
+    ] as const) assert.throws(() => read(entry), error as RegExp, JSON.stringify(entry));
+    // A full entry and the bundled catalog pass.
+    read({ id, name: "X", reasoning: true, thinkingLevelMap: { xhigh: "xhigh", max: null }, input: ["text", "image"],
+      contextWindow: 1_000_000, maxTokens: 128_000, cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 } });
+    assert.ok(noSettings().models.length > 0);
+  } finally { rmSync(temp, { recursive: true }); }
+});
+
+test("a broken config falls back to the catalog and says why", () => {
+  const temp = mkdtempSync(join(tmpdir(), "portkey-broken-"));
+  try {
+    const path = join(temp, "config.json");
+    const logged: string[] = [];
+    writeFileSync(path, "{ not json");
+    const config = loadConfig(path, MODELS, (m) => logged.push(m));
+    assert.equal(config.models.length, noSettings().models.length);
+    assert.match(logged[0], /ignoring .*config\.json, using the built-in catalog only: Unable to read/);
+    writeFileSync(path, JSON.stringify({ models: [{ id: "x", contextwindow: 1 }] }));
+    loadConfig(path, MODELS, (m) => logged.push(m));
+    assert.match(logged[1], /unknown field contextwindow/);
+    // A good config loads quietly.
+    writeFileSync(path, JSON.stringify({ models: ["us.anthropic.claude-x"] }));
+    assert.equal(loadConfig(path, MODELS, (m) => logged.push(m)).models.at(-1)!.id, "us.anthropic.claude-x");
+    assert.equal(logged.length, 2);
   } finally { rmSync(temp, { recursive: true }); }
 });
 

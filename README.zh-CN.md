@@ -78,11 +78,13 @@ magpie 会按需安装 Bun、插件的运行时依赖和它的 pi 运行时。�
 
 旧版本文件里的 `baseUrl` 和 `provider` 会被忽略——它们已不决定任何路由。凭证只放在 magpie 的登录里，不进这个文件：读取器会拒绝 API key 和敏感头（`apiKey`、`virtualKey`、`authorization`、`*-api-key`、`token`、`secret`、`cookie`）。改完重启插件生效。
 
+插件启动时会逐条检查模型条目：未知字段（如 `contextwindow`）或类型不对都会报出来，并指明是哪一条。读不了的配置文件不会让插件挂掉：provider 仍会用内置目录加载，原因写进 magpie 的日志。
+
 请求以未压缩形式发送。Portkey 线上网关按纯 JSON 解析请求体、不做解压：gzip 或 deflate 的请求体在 `/model/{id}/converse-stream` 和 `/v1/messages` 上都会返回 `400`（`Value null at 'messages'`），即使只有 95 字节也一样。要压缩请求需要网关先支持请求解压。响应同样不压缩，发 `Accept-Encoding: gzip, br` 也不会改变响应头。
 
 ## 模型
 
-`models.json` 是可编辑的目录。条目可以是模型 ID 字符串，或带 `id`、`name`、`reasoning`、`thinkingLevelMap`、`input`、`contextWindow`、`maxTokens`、`cost` 的对象。价格是 USD / 百万 token，`input`、`output`、`cacheRead`、`cacheWrite` 分列。
+`models.json` 是可编辑的目录。条目可以是模型 ID 字符串，或带 `id`、`name`、`reasoning`、`thinkingLevelMap`、`input`、`contextWindow`、`maxTokens`、`cost` 的对象。价格是 USD / 百万 token，`input`、`output`、`cacheRead`、`cacheWrite` 分列。条目没写的字段按模型系列取默认值：Anthropic 与 Nova Pro / Premier 开启推理、支持图片、1M 上下文、64K 输出；其他系列只支持文本、不开推理、200K 上下文、8K 输出。价格默认为 0。
 
 内置目录覆盖当前 Bedrock 主力型号，外加常见的 Amazon / DeepSeek / Meta / Mistral 模型。可用性、上限和价格取决于你的 AWS 账号和 Portkey 路由，请按需调整目录。账号登录后，magpie 会通过 provider 的 `refreshModels` 刷新列表：网关 `/models` 的响应与目录合并——目录条目保留自己的元数据，未知 id 以保守默认值加入。
 

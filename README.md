@@ -78,11 +78,13 @@ Gateways that need settings shared by every account can put them in an optional 
 
 `baseUrl` and `provider` from earlier versions' files are ignored — they route nothing now. Credentials belong in magpie's sign-in, never in this file: the reader rejects API keys and secret headers (`apiKey`, `virtualKey`, `authorization`, `*-api-key`, `token`, `secret`, `cookie`). Restart the plugin after changing it.
 
+Each model entry is checked when the plugin starts: an unknown field (e.g. `contextwindow`) or a wrong type is reported with the entry it is in. A file that cannot be read this way is set aside, not fatal: the provider still loads with the built-in catalog, and the reason goes to magpie's log.
+
 Requests are sent uncompressed. Portkey's deployed gateway reads the body as plain JSON and does not decompress: a gzip or deflate body answers `400` with `Value null at 'messages'` even at 95 bytes, on both `/model/{id}/converse-stream` and `/v1/messages`. Compressing the request needs the gateway to enable request decompression first. Responses are also sent uncompressed, and `Accept-Encoding: gzip, br` changes nothing.
 
 ## Models
 
-`models.json` is an editable catalog. Entries may be model ID strings or objects with `id`, `name`, `reasoning`, `thinkingLevelMap`, `input`, `contextWindow`, `maxTokens` and `cost`. Prices are USD per million tokens, with separate `input`, `output`, `cacheRead` and `cacheWrite` values.
+`models.json` is an editable catalog. Entries may be model ID strings or objects with `id`, `name`, `reasoning`, `thinkingLevelMap`, `input`, `contextWindow`, `maxTokens` and `cost`. Prices are USD per million tokens, with separate `input`, `output`, `cacheRead` and `cacheWrite` values. Fields an entry leaves out take per-family defaults: Anthropic and Nova Pro / Premier ids get reasoning, image input, a 1M context and 64K output; other families get text only, no reasoning, 200K context and 8K output. Prices default to 0.
 
 The included catalog covers the current Bedrock line-up plus common Amazon / DeepSeek / Meta / Mistral models. Availability, limits and prices depend on your AWS account and Portkey route; update the catalog to match them. When an account is signed in, magpie refreshes the list through the provider's `refreshModels`: the gateway's `/models` response is merged with the catalog — catalog entries keep their metadata, unknown ids are added with conservative defaults. The catalog's `name` is what magpie's model picker displays (e.g. `Claude Opus 5.5` instead of the raw Bedrock id); the id remains what requests use.
 
