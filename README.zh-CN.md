@@ -74,6 +74,7 @@ magpie 会按需安装 Bun、插件的运行时依赖和它的 pi 运行时。�
 
 - `configId`：随所有账号请求发送的 `x-portkey-config` 配置 id。
 - `headers`：随所有账号请求发送的额外非敏感网关头。
+- `models`：网关 `/models` 列表里不显示、但能直接按 id 调用的隐藏模型（如 `["us.anthropic.claude-fable-5-2"]`）。条目格式同 `models.json`；它们总会被注册，与目录同 id 的条目会覆盖目录里的那个。
 
 旧版本文件里的 `baseUrl` 和 `provider` 会被忽略——它们已不决定任何路由。凭证只放在 magpie 的登录里，不进这个文件：读取器会拒绝 API key 和敏感头（`apiKey`、`virtualKey`、`authorization`、`*-api-key`、`token`、`secret`、`cookie`）。改完重启插件生效。
 

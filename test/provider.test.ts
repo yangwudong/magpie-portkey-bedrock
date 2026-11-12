@@ -442,6 +442,15 @@ test("config validation covers headers, models and secret fields", () => {
       "x-portkey-account-base-url": "$PORTKEY_BASE_URL",
       "x-portkey-config": "cfg-1",
     });
+    // Hidden models: appended by id, override a catalog entry of the same id.
+    const extra = read(
+      { models: ["us.anthropic.claude-fable-5-2", { id: "model-1", name: "Renamed" }] },
+      ["model-1", "model-2"],
+    );
+    assert.deepEqual(extra.models.map((m) => m.id), ["model-2", "us.anthropic.claude-fable-5-2", "model-1"]);
+    assert.equal(extra.models.find((m) => m.id === "model-1")?.name, "Renamed");
+    assert.equal(read({ models: [] }).models.length, 1);
+    assert.throws(() => read({ models: [42] }), /model ID/);
   } finally { rmSync(temp, { recursive: true }); }
 });
 

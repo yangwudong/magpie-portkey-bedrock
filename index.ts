@@ -226,10 +226,16 @@ export function readConfig(configPath = CONFIG_PATH, modelsPath = MODELS_PATH): 
   headers["x-portkey-provider"] = `$${PROVIDER_ENV}`;
   headers[BASE_URL_HEADER] = `$${BASE_URL_ENV}`;
   if (raw.configId) headers["x-portkey-config"] = raw.configId;
-  return {
-    headers,
-    models: readModels(readJsonFile(modelsPath), modelsPath),
-  };
+  // Extra models the gateway serves but its /models list hides, callable by
+  // id. They join the catalog (overriding an entry of the same id) and are
+  // registered whether or not discovery reports them.
+  const models = readModels(readJsonFile(modelsPath), modelsPath);
+  if (raw.models !== undefined) {
+    const extra = Array.isArray(raw.models) && raw.models.length === 0 ? [] : readModels(raw.models, configPath);
+    const ids = new Set(extra.map((model) => model.id));
+    models.splice(0, models.length, ...models.filter((model) => !ids.has(model.id)), ...extra);
+  }
+  return { headers, models };
 }
 
 // Resolves `$VAR` header templates against an account's env map, as pi's

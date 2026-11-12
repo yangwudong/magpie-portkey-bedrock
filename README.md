@@ -74,6 +74,7 @@ Gateways that need settings shared by every account can put them in an optional 
 
 - `configId`: an `x-portkey-config` configuration id sent with every account's requests.
 - `headers`: additional non-secret gateway headers sent with every account's requests.
+- `models`: extra models that the gateway's `/models` list hides but that can be called by id (e.g. `["us.anthropic.claude-fable-5-2"]`). Same entry format as `models.json`; they are always registered, and an entry overrides a catalog model with the same id.
 
 `baseUrl` and `provider` from earlier versions' files are ignored — they route nothing now. Credentials belong in magpie's sign-in, never in this file: the reader rejects API keys and secret headers (`apiKey`, `virtualKey`, `authorization`, `*-api-key`, `token`, `secret`, `cookie`). Restart the plugin after changing it.
 
