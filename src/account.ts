@@ -42,27 +42,6 @@ export function accountFormOf(credential: unknown): PortkeyAccountForm | undefin
   return { baseUrl, provider, apiKey: key, name };
 }
 
-// What is known of a signed-in account, to offer it for an update: its
-// gateway and route, by name — never its key. magpie hands the plugin an
-// account's credential whenever it lists that account's models, so each
-// account is learned there. Kept in memory only.
-export interface KnownAccount {
-  baseUrl: string;
-  provider: string;
-}
-export type KnownAccounts = Map<string, KnownAccount>;
-
-export function rememberAccount(known: KnownAccounts, credential: unknown): void {
-  const form = accountFormOf(credential);
-  if (form) known.set(form.name, { baseUrl: form.baseUrl, provider: form.provider });
-}
-
-// The first question of a sign-in while an account can be updated: add one,
-// or update one magpie already has. Updating is by name, and a sign-in under
-// an existing account's name replaces that account — so an update keeps the
-// name of the account it updates and never asks for it.
-export const NEW_ACCOUNT = "new";
-
 // OAuthCredentials keeps `access` (the key magpie sends as Bearer) and any
 // extra fields; `env` rides the credential so pi resolves the header
 // templates with it on every request of this account. `accountId` is what
@@ -98,17 +77,11 @@ export function resolveTemplateHeaders(headers: Record<string, string>, env: Rec
 
 // The sign-in form magpie renders in its dialog: each onPrompt is one GUI
 // input, asked and answered in turn; no browser, no extra confirmation — the
-// last answer saves the account. While an account is already signed in, the
-// form first asks (a choice, not an input) whether to add an account or to
-// update one: an update asks its gateway, route and key — empty keeps the
-// account's gateway or route — under the account's own name, so it replaces
-// that account rather than adding one. Adding asks three fields that route
-// the account and a fourth, an optional name, that only labels it in
-// magpie's lists (empty: part of the key).
+// last answer saves the account. Three fields route the account; the fourth,
+// an optional name, only labels it in magpie's lists (empty: part of the key).
 //
-// Placeholders are Portkey's public defaults, never another account's
-// values — except in an update, where they are the account's own gateway
-// and route, the values an empty answer keeps. No key is ever shown.
+// Placeholders are always Portkey's public defaults, never another account's
+// values. An empty answer means the default the placeholder shows.
 //
 // magpie's bridge restarts a login that has already finished when the front
 // end asks the method again, and the front end does ask again right after the
@@ -121,76 +94,22 @@ export function resolveTemplateHeaders(headers: Record<string, string>, env: Rec
 // instead of restarting it, and authorize collects the result. No state is
 // kept between sign-ins.
 const FINISH_HOLD_MS = 1_000;
-// How often a name an account already has is asked over before the sign-in
-// gives up. Giving up is a last resort: its reason does not reach the user.
-const NAME_RETRIES = 3;
 const DEFAULT_BASE_URL = "https://api.portkey.ai/v1";
 const DEFAULT_PROVIDER = "aws-bedrock";
 
-export async function portkeyLoginForm(
-  callbacks: OAuthLoginCallbacks,
-  known: KnownAccounts = new Map(),
-): Promise<PortkeyAccountForm> {
+export async function portkeyLoginForm(callbacks: OAuthLoginCallbacks): Promise<PortkeyAccountForm> {
   const ask = async (message: string, placeholder: string) =>
     (await callbacks.onPrompt({ message, placeholder })).trim();
-
-  // Which account this sign-in is for: a new one, or one to update. Only
-  // asked while there is an account to update. A choice that is not one of
-  // the options cancels the sign-in.
-  let update: { name: string } & KnownAccount | undefined;
-  if (known.size > 0) {
-    const chosen = await callbacks.onSelect?.({
-      message: "Add an account, or update one you have",
-      options: [
-        { id: NEW_ACCOUNT, label: "Add a new account" },
-        ...[...known].map(([id, account]) => ({ id, label: `Update "${id}"` })),
-      ],
-    });
-    if (chosen !== NEW_ACCOUNT) {
-      if (!chosen || !known.has(chosen)) throw new Error("Sign-in cancelled");
-      update = { name: chosen, ...known.get(chosen)! };
-    }
-  }
-
-  // An update keeps the account's gateway and route unless new ones are
-  // typed, and its name as it is. A key is always typed: none is kept to
-  // offer back.
-  if (update) {
-    const baseUrl = (await ask("Portkey gateway base URL (empty keeps this account's)", update.baseUrl)) || update.baseUrl;
-    const provider = (await ask("Portkey provider slug (x-portkey-provider, empty keeps this account's)", update.provider)) || update.provider;
-    const apiKey = await ask("Portkey API key", "pk-…");
-    if (!apiKey) throw new Error("A Portkey API key is required");
-    checkBaseUrl(baseUrl);
-    return finish(callbacks, { baseUrl, provider, apiKey, name: update.name }, `Updating the Portkey account "${update.name}"…`);
-  }
 
   const baseUrl = (await ask("Portkey gateway base URL", DEFAULT_BASE_URL)) || DEFAULT_BASE_URL;
   const provider = (await ask("Portkey provider slug (x-portkey-provider)", DEFAULT_PROVIDER)) || DEFAULT_PROVIDER;
   const apiKey = await ask("Portkey API key", "pk-…");
   if (!apiKey) throw new Error("A Portkey API key is required");
-  checkBaseUrl(baseUrl);
-  const derived = keyName(apiKey);
-  // magpie takes a sign-in under an existing account's name for that
-  // account again, which would replace it. Adding is for adding, so a name
-  // an account has is asked over — as a question, not a failure: magpie's
-  // bridge reports no reason a form gives up with, only "Sign-in
-  // cancelled", so the name is asked again until it is free.
-  let name = (await ask("Account name (optional, leave empty to use part of the key)", derived)) || derived;
-  for (let taken = 1; known.has(name); taken++) {
-    if (taken >= NAME_RETRIES) throw new Error(`An account named "${name}" already exists. Sign in again and choose "Update" to change it.`);
-    name = (await ask(`An account is already named "${name}". Choose another name`, derived)) || derived;
-  }
-  return finish(callbacks, { baseUrl, provider, apiKey, name }, "Saving the Portkey account…");
-}
-
-function checkBaseUrl(baseUrl: string): void {
   if (!/^https?:\/\/\S+$/i.test(baseUrl)) throw new Error(`The base URL must start with http:// or https://, not ${baseUrl}`);
-}
+  const derived = keyName(apiKey);
+  const name = (await ask("Account name (optional, leave empty to use part of the key)", derived)) || derived;
 
-// The end of a sign-in: the progress notice and the hold that let magpie's
-// front end find the login still running (see the note above).
-async function finish(callbacks: OAuthLoginCallbacks, form: PortkeyAccountForm, progress: string): Promise<PortkeyAccountForm> {
-  callbacks.onProgress?.(progress);
+  callbacks.onProgress?.("Saving the Portkey account…");
   await new Promise((resolve) => setTimeout(resolve, FINISH_HOLD_MS));
-  return form;
+  return { baseUrl, provider, apiKey, name };
 }

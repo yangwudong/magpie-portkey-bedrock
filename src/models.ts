@@ -1,6 +1,6 @@
 // The model list: the catalog, plus what the account's gateway reports.
 import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
-import { accountFormOf, BASE_URL_ENV, BASE_URL_HEADER, PROVIDER_ENV, rememberAccount, resolveTemplateHeaders, type KnownAccounts } from "./account.ts";
+import { accountFormOf, BASE_URL_ENV, BASE_URL_HEADER, PROVIDER_ENV, resolveTemplateHeaders } from "./account.ts";
 import type { ModelConfig, PortkeyConfig } from "./config.ts";
 
 // The minimal shape of pi's RefreshModelsContext this extension uses. Kept
@@ -76,20 +76,11 @@ function discoveredModelDefaults(id: string): Pick<ChatModelConfig, "reasoning" 
 // it with the catalog: catalog entries keep their metadata, unknown ids are
 // added with conservative defaults. Throws so magpie logs the reason and keeps
 // the registered catalog.
-//
-// magpie lists an account's models whenever it signs in, starts or changes
-// auth, handing the account's credential here: that is where the plugin
-// learns its accounts (their gateway and route by name, for the sign-in
-// form's update — never a key), into `accounts` when one is given. It is
-// learned before anything else, as a gateway that cannot be reached still
-// leaves an account to update.
 export async function discoverGatewayModels(
   config: PortkeyConfig,
   context: GatewayModelContext,
   send: typeof fetch = globalThis.fetch,
-  accounts?: KnownAccounts,
 ): Promise<ProviderModelConfig[]> {
-  if (accounts) rememberAccount(accounts, context.credential);
   const catalog = () => toProviderModels(config.models, config.headers);
   if (!context.allowNetwork || context.signal.aborted) return catalog();
   const account = accountFormOf(context.credential);

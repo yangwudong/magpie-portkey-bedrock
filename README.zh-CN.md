@@ -17,7 +17,6 @@ English documentation: [README.md](./README.md)
 
 - 经 `@ai-sdk/amazon-bedrock` 的原生 Bedrock Converse 流式输出。
 - GUI 登录表单：**网关地址、Portkey provider slug、API key**，外加选填的账号名称——无需改配置文件、无需浏览器。每个账号路由到自己的网关。
-- 修改已有账号：换 key、网关或路由，名称不变，不会新增账号。
 - 多账号：每个已登录账号自带 key、网关地址和 provider 路由；magpie 按账号做轮转、故障切换和限流。
 - 动态模型发现：账号登录后，provider 会请求**该账号网关**的模型列表（`GET /v1/models`），把账号实际可用的模型合并进目录；失败时保留目录。
 - 文本、视觉、流式工具参数与工具结果，包括图片结果和失败的工具。工具参数按增量解析——耗时与流长度线性相关，而非平方级。
@@ -48,22 +47,9 @@ magpie plugin add "$PWD/magpie-portkey-bedrock"
 3. **API key**——该账号的 Portkey 网关 key。
 4. **账号名称**（选填）——magpie 列表里显示的名字。留空则用 key 的首尾各四位命名，形如 `API key AbCd…Yz12`，key 的其余部分不会显示。
 
-名称即账号身份：请给每个账号起不同的名字。
+名称即账号身份：用一个已有账号的名称再次登录，会更新那个账号（换 key、网关或路由），而不是新增一个。请给每个账号起不同的名字。
 
 网关地址或 slug 留空，即使用输入框提示里的 Portkey 公共默认值（`https://api.portkey.ai/v1`、`aws-bedrock`）；提示永远不会显示你自己的配置。magpie 把每次登录存进配置目录的 `plugin-auth.json`。每多一个账号就再登录一次：各账号保留自己的 key、网关和 provider 路由，magpie 的路由、故障切换和账号限额按账号生效。请求同时以 `Authorization: Bearer …` 和 `x-portkey-api-key` 携带所选账号的 key。
-
-### 修改账号的 key、网关或路由
-
-已有账号登录后，登录表单会先让你选择：**Add a new account**，或对 magpie 已列出的每个账号选 **Update "名称"**。选中要修改的账号后：
-
-- **网关地址**和 **provider slug** 的输入框提示会预填该账号自己的值——直接回车保留，或输入新值。
-- **API key** 必须重新输入；任何 key 都不会回显。
-
-账号名称保持不变，因此 magpie 会把这次登录写回**同一个账号**，而不是新增一个。要给账号改名，请删除它并用新名称重新登录。
-
-新增账号时如果用了已被占用的名称，表单会让你换一个名字，而不会覆盖已有账号。
-
-表单通过 magpie 得知有哪些账号：magpie 每次列出某个账号的模型时（登录后、以及启动时）会把该账号交给插件。账号在被列出过一次之前不会出现在选项里；插件不保存任何 key。
 
 在 **Providers → Portkey Bedrock** 里展开，给 agent 选 `portkey-bedrock/…` 模型：
 
