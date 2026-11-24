@@ -96,26 +96,48 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
   // answer too, before it authorizes. The form must neither ask again nor
   // loop back to its first field; authorize then finishes the login with no
   // URL (nothing opens) and the callback saves it.
-  async function signInForm(account: string | undefined, baseUrl: string, provider: string, apiKey: string, name = "") {
+  //
+  // `pick` answers the form's choice, when it offers one (a sign-in while an
+  // account is already signed in): the label of the option chosen, as the
+  // dialog's button gives it. `expected` is the questions asked, in order.
+  // `renamed` is the answer to the name asked over, when the name given is
+  // one an account already has.
+  async function signInForm(
+    account: string | undefined, baseUrl: string, provider: string, apiKey: string, name = "",
+    pick?: string, expected = ["gateway", "provider", "API", "name"], renamed?: string,
+  ) {
     let inputs: Record<string, string> = {};
     const asked: string[] = [];
     // startPluginSignIn: a round with the inputs so far
     let r = (await rpc("prompt", { provider: "portkey-bedrock", method: 0, inputs })).result;
     while (r?.prompt) {
       const q = r.prompt;
+      if (q.type === "select") {
+        // renderPluginAsk: a choice is buttons; the one clicked is answered
+        assert.equal(q.message, "Add an account, or update one you have", JSON.stringify(q));
+        const option = q.options.find((o: any) => o.label === pick);
+        assert.ok(option, `no option "${pick}" among ${q.options.map((o: any) => o.label).join(", ")}`);
+        // pluginAnswer: the dialog's button gives the option's value, and
+        // the host's plugin-signin/prompt puts it in the inputs
+        // (plugins.go), which the next round carries.
+        inputs = { ...inputs, [q.key]: option.value };
+        r = (await rpc("prompt", { provider: "portkey-bedrock", method: 0, inputs })).result;
+        continue;
+      }
       asked.push(q.message);
-      if (asked.length > 4) throw new Error(`the form asked again: ${asked.join(" / ")}`);
+      if (asked.length > expected.length) throw new Error(`the form asked again: ${asked.join(" / ")}`);
       const value = /base URL/i.test(q.message) ? baseUrl
         : /provider slug/i.test(q.message) ? provider
           : /API key/i.test(q.message) ? apiKey
-            : name;
+            : /already named/i.test(q.message) ? (renamed ?? "")
+              : name;
       // pluginAnswer: the answer, as the host's plugin-signin/prompt adds it
       inputs = { ...inputs, [q.key]: value };
       await rpc("prompt", { provider: "portkey-bedrock", method: 0, inputs });
       // …then startPluginSignIn again with what it gave back
       r = (await rpc("prompt", { provider: "portkey-bedrock", method: 0, inputs })).result;
     }
-    assert.deepEqual(asked.map((m) => m.split(" ")[1]), ["gateway", "provider", "API", "name"], asked.join(" / "));
+    assert.deepEqual(asked.map((m) => m.split(" ")[1]), expected, asked.join(" / "));
     const authorize = await rpc("authorize", { provider: "portkey-bedrock", method: 0, inputs, ...(account ? { account } : {}) });
     // Older hosts answer without `ok`; a session is what both versions give.
     assert.ok(authorize.result.session, JSON.stringify(authorize.result));
@@ -180,7 +202,7 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
     // A second account, through the same form, routed to its own gateway
     // and provider slug: requests for it leave with its key and route even
     // while the first stays signed in.
-    const secondKey = await signInForm("new", `http://127.0.0.1:${port}/v1`, "@aws-second", "second-test-key");
+    const secondKey = await signInForm("new", `http://127.0.0.1:${port}/v1`, "@aws-second", "second-test-key", "", "Add a new account");
     events = textEvents();
     const secondAnswer = await ask({}, secondKey);
     assert.equal(secondAnswer.head.status, 200, secondAnswer.data);
@@ -210,14 +232,45 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
       ["API key seco…-key", "Team A"],
     );
 
-    // magpie takes a sign-in under a name it already has for that account
-    // again: a second key given the same alias replaces the first rather
-    // than adding a third account. Say so in the docs; prove it here.
-    const again = await signInForm("new", `http://127.0.0.1:${port}/v1`, "@aws-third", "third-test-key", "Team A");
-    assert.equal(again, "portkey-bedrock");
-    const after = JSON.parse(readFileSync(join(temp, "auth.json"), "utf8"));
-    assert.equal(Object.keys(after).filter((k) => k.startsWith("portkey-bedrock")).length, 2);
-    assert.equal(after["portkey-bedrock"].access, "third-test-key");
+    // Updating an account: the host has listed the models of both accounts
+    // since each signed in, handing the plugin their credentials, so a new
+    // sign-in offers them by name. Choosing one asks for its gateway, route
+    // and key under that name — never a new name — and magpie keeps it the
+    // same account: nothing is added, the name stays, what was typed
+    // replaces what the account had.
+    const accounts = Object.keys(auth).filter((k) => k.startsWith("portkey-bedrock"));
+    const updated = await signInForm("new", `http://127.0.0.1:${port}/v1`, "@aws-third-rerouted", "fourth-test-key", "", 'Update "Team A"',
+      ["gateway", "provider", "API"]);
+    assert.equal(updated, "portkey-bedrock");
+    events = textEvents();
+    status = 200;
+    const asUpdated = await ask({}, updated);
+    assert.equal(asUpdated.head.status, 200, asUpdated.data);
+    const final = JSON.parse(readFileSync(join(temp, "auth.json"), "utf8"));
+    assert.deepEqual(Object.keys(final).filter((k) => k.startsWith("portkey-bedrock")), accounts);
+    assert.equal(final["portkey-bedrock"].accountId, "Team A");
+    assert.equal(final["portkey-bedrock"].access, "fourth-test-key");
+    assert.equal(final["portkey-bedrock"].env.PORTKEY_PROVIDER, "@aws-third-rerouted");
+    // The request went out with the account's new key and route.
+    assert.equal(requests.at(-1)!.headers["x-portkey-api-key"], "fourth-test-key");
+    assert.equal(requests.at(-1)!.headers["x-portkey-provider"], "@aws-third-rerouted");
+    // The other account is as it was.
+    assert.equal(final[secondKey].access, "second-test-key");
+    assert.equal(final[secondKey].env.PORTKEY_PROVIDER, "@aws-second");
+
+    // Adding an account under a name one already has would replace that
+    // account — the name is the account — so adding asks for another name
+    // instead, and the account is added under it.
+    const renamed = await signInForm("new", `http://127.0.0.1:${port}/v1`, "@aws-fourth", "fifth-test-key", "Team A", "Add a new account",
+      ["gateway", "provider", "API", "name", "account"], "Team D");
+    assert.equal(renamed.startsWith("portkey-bedrock#"), true, renamed);
+    const afterAdded = JSON.parse(readFileSync(join(temp, "auth.json"), "utf8"));
+    assert.equal(Object.keys(afterAdded).filter((k) => k.startsWith("portkey-bedrock")).length, accounts.length + 1);
+    assert.equal(afterAdded[renamed].accountId, "Team D");
+    assert.equal(afterAdded[renamed].access, "fifth-test-key");
+    // "Team A" is still the account it was, with the key its update gave it.
+    assert.equal(afterAdded["portkey-bedrock"].access, "fourth-test-key");
+    assert.equal(afterAdded["portkey-bedrock"].env.PORTKEY_PROVIDER, "@aws-third-rerouted");
   } finally {
     for (const call of pending.values()) clearTimeout(call.timer);
     child.kill();

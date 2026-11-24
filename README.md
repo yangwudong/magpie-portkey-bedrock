@@ -17,6 +17,7 @@ The provider id is **`portkey-bedrock`**. Its models are available to every agen
 
 - Native Bedrock Converse streaming through `@ai-sdk/amazon-bedrock`.
 - GUI sign-in form: **base URL, Portkey provider slug, API key** and an optional account name — no config editing, no browser. Every account routes through its own gateway.
+- Update a signed-in account: change its key, gateway or route under the same name, without adding an account.
 - Multi-account: each signed-in account carries its own key, gateway URL and provider route; magpie rotates, fails over and rate-limits them per account.
 - Dynamic model discovery: once an account is signed in, the provider asks that account's gateway for its model list (`GET /v1/models`) and merges what it actually serves into the catalog; failures keep the catalog.
 - Text, vision, streamed tool arguments and tool results, including image results and failed tools. Tool arguments parse incrementally — linear in stream length, not quadratic.
@@ -47,9 +48,22 @@ Then sign in with your **Portkey gateway account** (the Providers page, or `magp
 3. **API key** — the account's Portkey gateway key.
 4. **Account name** (optional) — what magpie lists the account as. Left empty, it is named by both ends of its key, like `API key AbCd…Yz12`; the rest of the key is never shown.
 
-Names identify accounts: signing in again under a name an account already has updates that account (new key, gateway or route) instead of adding another. Give each account its own name.
+Names identify accounts: give each account its own name.
 
 An empty base URL or slug means Portkey's public default shown as the field's hint (`https://api.portkey.ai/v1`, `aws-bedrock`); the hints never show your own configuration. magpie keeps each sign-in in `plugin-auth.json` under its configuration directory. Sign in again for each further account: every account keeps its own key, gateway and provider route, and magpie's routing, failover and account limits apply per account. Requests send the selected account's key as both `Authorization: Bearer …` and `x-portkey-api-key`.
+
+### Change an account's key, gateway or route
+
+Once an account is signed in, the sign-in form starts with a choice: **Add a new account**, or **Update "name"** for each account magpie has listed. Choose the account to update, then:
+
+- **Base URL** and **provider slug** come prefilled as hints with that account's own values — press Enter to keep them, or type new ones.
+- **API key** is always typed afresh; no key is ever shown back.
+
+The account keeps its name, so magpie writes the sign-in over that same account instead of adding another. To rename an account, remove it and sign in again under the new name.
+
+Adding an account under a name that is already taken asks for another name rather than replacing the existing one.
+
+The form learns which accounts there are from magpie, which hands it an account whenever it lists that account's models — on sign-in, and when magpie starts. Until an account has been listed once it is not offered; no key is kept by the plugin.
 
 Select **Providers → Portkey Bedrock**, then choose a `portkey-bedrock/…` model for your agent:
 

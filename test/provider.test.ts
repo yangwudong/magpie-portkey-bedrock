@@ -634,6 +634,155 @@ test("account form credentials decode and the login form asks its three fields",
   await assert.rejects(() => signIn({ "Portkey gateway base URL": "gw.example", "Portkey API key": "pk" }), /http/);
 });
 
+// ---- updating a signed-in account ---------------------------------------------------
+
+// The provider's sign-in form as magpie's dialog runs it. Each question is
+// answered from `answers` by its message, a choice by its option's label.
+// Records what was asked. The provider is registered once: its accounts are
+// what this instance learned, as in magpie.
+function formProvider() {
+  let registered: any;
+  plugin({ registerProvider: (_id: string, options: unknown) => { registered = options; } } as any);
+  // magpie hands the plugin an account's credential when it lists that
+  // account's models. No gateway is asked here.
+  const learn = async (name: string, baseUrl: string, provider: string, key: string) => {
+    await registered.refreshModels(discoveryContext({
+      credential: { type: "oauth", access: key, refresh: key, expires: 4_102_444_800_000, accountId: name,
+        env: { PORTKEY_BASE_URL: baseUrl, PORTKEY_PROVIDER: provider } },
+      allowNetwork: false,
+    }) as any);
+  };
+  const signIn = async (answers: Record<string, string>, pick?: string) => {
+    const asked: Array<{ message: string; placeholder?: string }> = [];
+    const choices: Array<{ message: string; labels: string[] }> = [];
+    const credentials = await registered.oauth.login({
+      onPrompt: async (prompt: { message: string; placeholder?: string }) => {
+        asked.push(prompt);
+        return answers[prompt.message] ?? "";
+      },
+      onSelect: async (prompt: { message: string; options: Array<{ id: string; label: string }> }) => {
+        choices.push({ message: prompt.message, labels: prompt.options.map((o) => o.label) });
+        return prompt.options.find((o) => o.label === pick)?.id;
+      },
+      onAuth: () => {}, onProgress: () => {}, onDeviceCode: () => {},
+    });
+    return { credentials, asked, choices, key: registered.oauth.getApiKey(credentials) as string };
+  };
+  return { learn, signIn };
+}
+
+test("the sign-in form offers an update of a signed-in account and keeps its name", async () => {
+  // With no account signed in, the form asks its four fields as before and
+  // offers no choice.
+  const none = formProvider();
+  const fresh = await none.signIn({
+    "Portkey gateway base URL": "https://gw.example/v1", "Portkey provider slug (x-portkey-provider)": "@aws-1", "Portkey API key": "pk-1",
+  });
+  assert.equal(fresh.choices.length, 0);
+  assert.equal(fresh.asked.length, 4);
+  assert.equal(fresh.key, "pk-1");
+
+  const { learn, signIn } = formProvider();
+  await learn("#2", "https://gw.example/v1", "@aws-old", "pk-old");
+
+  // The choice comes first: add, or update by the name magpie lists.
+  const update = await signIn({ "Portkey API key": "pk-new" }, 'Update "#2"');
+  assert.deepEqual(update.choices, [{
+    message: "Add an account, or update one you have",
+    labels: ['Add a new account', 'Update "#2"'],
+  }]);
+  // An update asks the gateway, the route and the key — never the name —
+  // and hints the account's own gateway and route as what an empty answer
+  // keeps. The key's hint shows none of the old key.
+  assert.deepEqual(update.asked, [
+    { message: "Portkey gateway base URL (empty keeps this account's)", placeholder: "https://gw.example/v1" },
+    { message: "Portkey provider slug (x-portkey-provider, empty keeps this account's)", placeholder: "@aws-old" },
+    { message: "Portkey API key", placeholder: "pk-…" },
+  ]);
+  // Both left empty: only the key changed, under the same name — which is
+  // what makes magpie keep this the same account.
+  assert.equal(update.key, "pk-new");
+  assert.equal(update.credentials.accountId, "#2");
+  assert.equal(update.credentials.env.PORTKEY_BASE_URL, "https://gw.example/v1");
+  assert.equal(update.credentials.env.PORTKEY_PROVIDER, "@aws-old");
+
+  // New values typed replace the account's gateway and route.
+  const rerouted = await signIn({
+    "Portkey gateway base URL (empty keeps this account's)": "https://other.example/v1",
+    "Portkey provider slug (x-portkey-provider, empty keeps this account's)": "@aws-new",
+    "Portkey API key": "pk-newer",
+  }, 'Update "#2"');
+  assert.equal(rerouted.credentials.accountId, "#2");
+  assert.equal(rerouted.key, "pk-newer");
+  assert.equal(rerouted.credentials.env.PORTKEY_BASE_URL, "https://other.example/v1");
+  assert.equal(rerouted.credentials.env.PORTKEY_PROVIDER, "@aws-new");
+
+  // An update still needs a key, and a gateway typed must be a URL.
+  await assert.rejects(() => signIn({}, 'Update "#2"'), /API key is required/);
+  await assert.rejects(
+    () => signIn({ "Portkey gateway base URL (empty keeps this account's)": "gw.example", "Portkey API key": "pk" }, 'Update "#2"'),
+    /http/,
+  );
+
+  // A choice that is none of the options cancels rather than guesses.
+  await assert.rejects(() => signIn({ "Portkey API key": "pk" }, "Something else"), /cancelled/);
+});
+
+test("adding an account under a taken name asks for another, and never replaces the account", async () => {
+  const { learn, signIn } = formProvider();
+  await learn("Team A", "https://gw.example/v1", "@aws-a", "pk-a");
+
+  // The name is the account's identity: a new sign-in under a name an
+  // account has would replace it. So the name is asked over, saying why,
+  // until it is free — then the account is added under the new name.
+  const asked = await signIn({
+    "Portkey gateway base URL": "https://gw.example/v1", "Portkey provider slug (x-portkey-provider)": "@aws-b",
+    "Portkey API key": "pk-b", "Account name (optional, leave empty to use part of the key)": "Team A",
+    'An account is already named "Team A". Choose another name': "Team B",
+  }, "Add a new account");
+  assert.deepEqual(asked.asked.map((p) => p.message), [
+    "Portkey gateway base URL",
+    "Portkey provider slug (x-portkey-provider)",
+    "Portkey API key",
+    "Account name (optional, leave empty to use part of the key)",
+    'An account is already named "Team A". Choose another name',
+  ]);
+  assert.equal(asked.credentials.accountId, "Team B");
+
+  // A name of its own from the start is asked nothing more.
+  const own = formProvider();
+  await own.learn("Team A", "https://gw.example/v1", "@aws-a", "pk-a");
+  const plain = await own.signIn({
+    "Portkey gateway base URL": "https://gw.example/v1", "Portkey provider slug (x-portkey-provider)": "@aws-b",
+    "Portkey API key": "pk-b", "Account name (optional, leave empty to use part of the key)": "Team C",
+  }, "Add a new account");
+  assert.equal(plain.asked.length, 4);
+  assert.equal(plain.credentials.accountId, "Team C");
+
+  // Asked over, an empty answer names the account by its key, as the first
+  // question does.
+  const byKey = await signIn({
+    "Portkey API key": "pk-bykey", "Account name (optional, leave empty to use part of the key)": "Team A",
+  }, "Add a new account");
+  assert.equal(byKey.asked.length, 5);
+  assert.equal(byKey.credentials.accountId, keyName("pk-bykey"));
+
+  // Keeping to the taken name gives up in the end — magpie's bridge shows
+  // no reason a form gives up with, so it is the last resort: the name is
+  // asked over twice before it.
+  const stubborn = formProvider();
+  await stubborn.learn("Team A", "https://gw.example/v1", "@aws-a", "pk-a");
+  const NAME = "Account name (optional, leave empty to use part of the key)";
+  const askedOver = 'An account is already named "Team A". Choose another name';
+  await assert.rejects(
+    () => stubborn.signIn(
+      { "Portkey API key": "pk-stubborn", [NAME]: "Team A", [askedOver]: "Team A" },
+      "Add a new account",
+    ).then((r) => r.asked.length),
+    /An account named "Team A" already exists/,
+  );
+});
+
 test("per-account headers route the request and the base-URL courier is stripped", async () => {
   const captured: { url?: string; init?: RequestInit } = {};
   const stream = createPortkeyStream({
