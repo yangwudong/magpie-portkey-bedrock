@@ -1,16 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeContext, type Api, type Context, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai";
-import plugin, { accountFormOf, CONFIG_PATH, createPortkeyStream, defaultConfigPath, discoverGatewayModels, keyName, loadConfig, readConfig, toProviderModels } from "../index.ts";
+import plugin, { accountFormOf, CONFIG_PATH, createPortkeyStream, DEFAULT_SWITCHES, defaultConfigPath, discoverGatewayModels, keyName, loadConfig, MAGPIE_PLUGINS_PATH, readConfig, readMagpieOptions, toProviderModels, type PortkeyConfig } from "../index.ts";
 import { end, textEvents, usage, wireResponse, type WireEvent } from "./wire.ts";
 
 // The catalog with no shared settings, as a fresh install has: never the
 // user's own config file.
 const MODELS = fileURLToPath(new URL("../models.json", import.meta.url));
+const root = dirname(MODELS);
 const noSettings = () => readConfig(join(tmpdir(), "portkey-no-such-config.json"), MODELS);
 
 export const model: Model<Api> = {
@@ -247,6 +248,54 @@ test("HTTP refusal reaches onResponse for Magpie failover without retries", asyn
   assert.deepEqual(response, { status: 429, headers: { "content-type": "application/json", "retry-after": "7" } });
 });
 
+test("a failure names the gateway's trace and says why it refused", async () => {
+  const refused = async (status: number, body: unknown, headers: Record<string, string> = {}) => {
+    const { message } = await ask([], context, {
+      fetch: async () => new Response(typeof body === "string" ? body : JSON.stringify(body), {
+        status, headers: { "content-type": "application/json", "x-portkey-trace-id": "trace-abc-123", ...headers },
+      }),
+    });
+    return message.errorMessage ?? "";
+  };
+  // Portkey's own refusal: its words, its code, and the trace to find it by.
+  const portkey = await refused(403, { message: "Portkey Error: Forbidden!. Error Code: 033", error: { code: "033" } });
+  assert.match(portkey, /^Portkey refused the request \(HTTP 403\)/);
+  assert.match(portkey, /Error Code: 033/);
+  assert.match(portkey, /Portkey trace id: trace-abc-123/);
+  assert.match(portkey, /API key's scopes/);
+  assert.doesNotMatch(portkey, /Chat is unaffected/);
+  // A budget is something the user can fix.
+  const budget = await refused(412, { message: "Budget exhausted" });
+  assert.match(budget, /a budget is exhausted \(HTTP 412\)/);
+  assert.match(budget, /Portkey trace id: trace-abc-123/);
+  // AWS's refusal names the action, and says chat is what broke; the account
+  // in it stays out of the message, the SDK's copy of the body included.
+  const aws = { Message: "User: arn:aws:iam::123456789012:user/PortkeyUser is not authorized to perform: bedrock:InvokeModelWithResponseStream" };
+  const iam = await refused(403, aws);
+  assert.match(iam, /^AWS denied bedrock:InvokeModelWithResponseStream/);
+  assert.match(iam, /Allow bedrock:InvokeModelWithResponseStream on the AWS principal/);
+  assert.doesNotMatch(iam, /123456789012/);
+  assert.doesNotMatch(iam, /Chat is unaffected/);
+  // Throttling is not a refusal: it keeps the SDK's wording, with the trace.
+  const throttled = await refused(429, { message: "Slow down" }, { "retry-after": "7" });
+  assert.doesNotMatch(throttled, /Portkey refused/);
+  assert.match(throttled, /HTTP 429/);
+  assert.match(throttled, /Portkey trace id: trace-abc-123/);
+  // A gateway that sends no trace id is not invented one.
+  const bare = await refused(500, "boom", { "x-portkey-trace-id": "" });
+  assert.match(bare, /HTTP 500/);
+  assert.doesNotMatch(bare, /trace id/);
+  // A failure the gateway does not own is no refusal: a 502 is the gateway
+  // down, and the SDK's own account of it is kept. Nobody is sent to check
+  // their key's scopes over it.
+  const down = await refused(502, "<html><body>502 Bad Gateway</body></html>");
+  assert.doesNotMatch(down, /scopes|refused|answered HTTP 502/);
+  assert.match(down, /HTTP 502/);
+  assert.match(down, /Portkey trace id: trace-abc-123/);
+  // Nothing quoted, nothing shown as quoted.
+  assert.doesNotMatch(await refused(403, null), /""/);
+});
+
 test("a timeout is reported as one, not as a user abort", async () => {
   const result = await ask([], context, { timeoutMs: 20, fetch: async (_url, init) => {
     return new Promise<Response>((_resolve, reject) => {
@@ -404,24 +453,16 @@ test("model discovery fails closed and keeps the catalog", async () => {
   });
   assert.equal(offline.length, config.models.length);
 
-  // Gateways that refuse to list models (403/404) keep the catalog quietly.
-  for (const status of [403, 404]) {
-    const kept = await discoverGatewayModels(
-      config,
-      discoveryContext() as any,
-      async () => new Response("denied", { status }),
-    );
-    assert.equal(kept.length, config.models.length);
-  }
+  // A gateway without a model list is fine and says nothing.
+  const quiet: string[] = [];
+  const kept = await discoverGatewayModels(config, discoveryContext() as any, async () => new Response("no route", { status: 404 }), (m) => quiet.push(m));
+  assert.equal(kept.length, config.models.length);
+  assert.deepEqual(quiet, []);
 
   // Other failures surface so magpie logs them.
   await assert.rejects(
     () => discoverGatewayModels(config, discoveryContext() as any, async () => new Response("boom", { status: 500 })),
     /answered 500/,
-  );
-  await assert.rejects(
-    () => discoverGatewayModels(config, discoveryContext() as any, async () => new Response(JSON.stringify({ data: [] }), { status: 200 })),
-    /returned no models/,
   );
   // A credential without the form's routing (a key sign-in from before the
   // form existed) lists nothing rather than guess a gateway for its key.
@@ -435,9 +476,45 @@ test("model discovery fails closed and keeps the catalog", async () => {
   }
 });
 
+test("a refused model list keeps the catalog and says why", async () => {
+  const config = noSettings();
+  const refused = async (response: Response) => {
+    const logged: string[] = [];
+    const models = await discoverGatewayModels(config, discoveryContext() as any, async () => response, (m) => logged.push(m));
+    assert.equal(models.length, config.models.length);
+    assert.equal(logged.length, 1);
+    return logged[0];
+  };
+  // Portkey's own refusal, as its gateway answers it: a code, no reason.
+  const portkey = await refused(new Response(JSON.stringify({
+    status: "failure",
+    message: "Portkey Error: Forbidden!. Error Code: 033",
+    error: { message: "Portkey Error: Forbidden!. Error Code: 033", code: "033" },
+  }), { status: 403 }));
+  assert.match(portkey, /^portkey-bedrock: Portkey refused the request \(HTTP 403\) Portkey Error: Forbidden!\. Error Code: 033\. Chat is unaffected; the built-in catalog stays\. /);
+  // The catalog is said to stay once, not twice.
+  assert.equal(portkey.match(/built-in catalog/g)?.length, 1);
+  assert.match(portkey, /completions\.write/);
+  // The gateway says the same thing twice in that body; it is quoted once.
+  assert.equal(portkey.match(/Error Code: 033/g)?.length, 1);
+  // AWS's refusal rides in the body, as in issue #1: the gateway passes the
+  // IAM message on without a status of its own.
+  const aws = JSON.stringify({ Context: null, Message: "User: arn:aws:iam::123456789012:user/PortkeyUser is not authorized to perform: bedrock:ListFoundationModels because no identity-based policy allows the bedrock:ListFoundationModels action" });
+  for (const response of [new Response(aws, { status: 403 }), new Response(JSON.stringify({ error: { message: `Invalid response received from bedrock: ${aws}` } }), { status: 200 })]) {
+    const message = await refused(response);
+    assert.match(message, /AWS denied bedrock:ListFoundationModels/);
+    assert.match(message, /Chat is unaffected/);
+    assert.doesNotMatch(message, /123456789012/);
+  }
+  // An empty or unreadable list is not a refusal, but still leaves a trace.
+  assert.match(await refused(new Response(JSON.stringify({ data: [] }), { status: 200 })), /gateway listed no models|Portkey answered HTTP 200/);
+  assert.match(await refused(new Response("<html>502</html>", { status: 200 })), /HTTP 200/);
+});
+
 test("the config lives in magpie's folder; the old file beside index.ts is read until it exists", () => {
-  // The preload (test/isolate-home.ts) redirects it away from the real file.
+  // The preload (test/isolate-home.ts) redirects both away from the real files.
   assert.equal(CONFIG_PATH, process.env.PORTKEY_BEDROCK_CONFIG);
+  assert.equal(MAGPIE_PLUGINS_PATH(), process.env.PORTKEY_BEDROCK_PLUGINS);
   const temp = mkdtempSync(join(tmpdir(), "portkey-path-"));
   try {
     const path = join(temp, "config.json");
@@ -490,6 +567,8 @@ test("a broken config falls back to the catalog and says why", () => {
     writeFileSync(path, "{ not json");
     const config = loadConfig(path, MODELS, (m) => logged.push(m));
     assert.equal(config.models.length, noSettings().models.length);
+    // A config that cannot be read logs nothing either.
+    assert.equal(config.log, false);
     assert.match(logged[0], /ignoring .*config\.json, using the built-in catalog only: Unable to read/);
     writeFileSync(path, JSON.stringify({ models: [{ id: "x", contextwindow: 1 }] }));
     loadConfig(path, MODELS, (m) => logged.push(m));
@@ -521,6 +600,19 @@ test("config validation covers headers, models and secret fields", () => {
     assert.throws(() => read({}, [42]), /model ID/);
     // configId type
     assert.throws(() => read({ configId: [] }), /configId must be a string/);
+    // log: off unless set to true, and only a boolean is accepted
+    assert.equal(read({}).log, false);
+    assert.equal(read({ log: true }).log, true);
+    assert.equal(read({ log: false }).log, false);
+    for (const log of ["false", 0, null]) assert.throws(() => read({ log }), /log must be true or false/);
+    // retry and cacheTtl1h: off unless set; retry is 0–5, as Portkey allows
+    // five attempts at the most.
+    assert.equal(read({}).retry, 0);
+    assert.equal(read({ retry: 5 }).retry, 5);
+    for (const retry of [-1, 6, 1.5, "3", null]) assert.throws(() => read({ retry }), /retry must be a whole number from 0 to 5/);
+    assert.equal(read({}).cacheTtl1h, false);
+    assert.equal(read({ cacheTtl1h: true }).cacheTtl1h, true);
+    assert.throws(() => read({ cacheTtl1h: "yes" }), /cacheTtl1h must be true or false/);
     // headers: array, non-string values
     assert.throws(() => read({ headers: [] }), /headers must be an object/);
     assert.throws(() => read({ headers: { "x-ok": 1 } }), /must be a string/);
@@ -547,6 +639,30 @@ test("config validation covers headers, models and secret fields", () => {
     assert.equal(read({ models: [] }).models.length, 1);
     assert.throws(() => read({ models: [42] }), /model ID/);
   } finally { rmSync(temp, { recursive: true }); }
+});
+
+test("the registered provider carries the switches magpie saved under the package's own name", async () => {
+  // magpie's Plugins page files a plugin's options under its package name, so
+  // the name the plugin looks itself up by has to be package.json's. A
+  // mismatch would go unnoticed: nothing is wrong, the switches just never
+  // apply. So the entry is written under the real name and the request is
+  // asked what it carried.
+  const name = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).name as string;
+  writeFileSync(MAGPIE_PLUGINS_PATH(), JSON.stringify({ plugins: [{ spec: name, target: root, options: { log: true, retry: 2 } }] }));
+  try {
+    let registered: any;
+    plugin({ registerProvider: (_id: string, options: unknown) => { registered = options; } } as any);
+    const seen = new Headers();
+    const stream = registered.streamSimple(model, normalizeContext(context), {
+      apiKey: "k", headers: accountGateway,
+      fetch: async (_url: any, init: any) => { for (const [k, v] of new Headers(init?.headers)) seen.append(k, v); return wireResponse(textEvents()); },
+    });
+    assert.equal((await stream.result()).stopReason, "stop");
+    assert.equal(seen.get("x-portkey-debug"), null);
+    assert.deepEqual(JSON.parse(seen.get("x-portkey-config")!), { retry: { attempts: 2, use_retry_after_headers: true } });
+  } finally {
+    rmSync(MAGPIE_PLUGINS_PATH(), { force: true });
+  }
 });
 
 test("registered refreshModels lists models through the gateway", async () => {
@@ -683,10 +799,10 @@ test("template headers resolve against the account env and are never sent unreso
 });
 
 test("cache points follow the model family and cache retention", async () => {
-  const capture = async (extra: SimpleStreamOptions = {}, id = model.id) => {
+  const capture = async (extra: SimpleStreamOptions = {}, id = model.id, switches: Partial<Pick<PortkeyConfig, "cacheTtl1h">> = {}) => {
     const captured: any = {};
     const custom = { ...model, id };
-    const stream = createPortkeyStream({})(custom, normalizeContext(context), {
+    const stream = createPortkeyStream({}, { ...DEFAULT_SWITCHES, ...switches })(custom, normalizeContext(context), {
       apiKey: "k", headers: accountGateway,
       fetch: async (_url, init) => { captured.body = JSON.parse(init!.body as string); return wireResponse(textEvents()); },
       ...extra,
@@ -701,6 +817,18 @@ test("cache points follow the model family and cache retention", async () => {
   // Long retention asks for the one-hour TTL.
   const claudeLong = await capture({ cacheRetention: "long" });
   assert.deepEqual(claudeLong.system.at(-1), { cachePoint: { type: "default", ttl: "1h" } });
+  // The cacheTtl1h switch asks for it on a caller's behalf: magpie's bridge
+  // names no retention, so a checkpoint would otherwise last five minutes.
+  const switched = await capture({}, model.id, { cacheTtl1h: true });
+  assert.deepEqual(switched.system.at(-1), { cachePoint: { type: "default", ttl: "1h" } });
+  assert.deepEqual(switched.messages.at(-1).content.at(-1), { cachePoint: { type: "default", ttl: "1h" } });
+  // What the caller asked for still stands over the switch.
+  const askedNone = await capture({ cacheRetention: "none" }, model.id, { cacheTtl1h: true });
+  assert.equal(askedNone.system.at(-1).cachePoint, undefined);
+  // And the switch is for Claude: Nova caches on its own and for five
+  // minutes, so its checkpoint is left as it was.
+  const nova = await capture({}, "amazon.nova-pro-v1:0", { cacheTtl1h: true });
+  assert.deepEqual(nova.system.at(-1), { cachePoint: { type: "default" } });
   // A non-caching family sends no cachePoint blocks at all.
   const llama = await capture({}, "meta.llama3-3-70b-instruct-v1:0");
   assert.equal(llama.system.at(-1).cachePoint, undefined);
@@ -728,6 +856,32 @@ test("streaming tool arguments parse incrementally and stay correct", async () =
   assert.deepEqual(call.arguments, JSON.parse(value));
 });
 
+test("the switches reach the gateway as headers, and a header set by hand wins", async () => {
+  const capture = async (headers: Record<string, string>, switches: Partial<Pick<PortkeyConfig, "log" | "retry">> = {}) => {
+    const seen = new Headers();
+    const stream = createPortkeyStream(headers, { ...DEFAULT_SWITCHES, ...switches })(model, normalizeContext(context), {
+      apiKey: "k", headers: accountGateway,
+      fetch: async (_url, init) => { for (const [k, v] of new Headers(init?.headers)) seen.append(k, v); return wireResponse(textEvents()); },
+    });
+    assert.equal((await stream.result()).stopReason, "stop");
+    return seen;
+  };
+  // log: off unless asked for, which is what the provider registers with.
+  assert.equal((await capture({})).get("x-portkey-debug"), "false");
+  assert.equal((await capture({}, { log: true })).get("x-portkey-debug"), null);
+  assert.equal((await capture({ "x-portkey-debug": "true" })).get("x-portkey-debug"), "true");
+  assert.equal((await capture({ "X-Portkey-Debug": "false" }, { log: true })).get("x-portkey-debug"), "false");
+  // retry: none by default; on, the gateway retries the upstream itself and
+  // waits as the provider's Retry-After asks.
+  assert.equal((await capture({})).get("x-portkey-config"), null);
+  assert.deepEqual(JSON.parse((await capture({}, { retry: 3 })).get("x-portkey-config")!), { retry: { attempts: 3, use_retry_after_headers: true } });
+  assert.equal((await capture({}, { retry: 0 })).get("x-portkey-config"), null);
+  // A saved config id owns the header: the switch gives way rather than
+  // replace the config, and whatever else it holds, with a retry alone.
+  assert.equal((await capture({ "x-portkey-config": "pc-saved" }, { retry: 3 })).get("x-portkey-config"), "pc-saved");
+  assert.equal((await capture({ "X-Portkey-Config": '{"cache":{"mode":"simple"}}' }, { retry: 3 })).get("x-portkey-config"), '{"cache":{"mode":"simple"}}');
+});
+
 test("derived account names tell keys apart without showing them", () => {
   // Keys that share a prefix still get different names.
   const a = keyName("Abcd1234567890xyzAAAA");
@@ -740,4 +894,62 @@ test("derived account names tell keys apart without showing them", () => {
   }
   // A key too short to cut shows none of itself.
   assert.equal(keyName("short"), "API key");
+});
+
+// ---- magpie's plugin options: the Plugins page's Options editor ------------------
+
+test("magpie's plugin options sit over the config file, which sits over the defaults", () => {
+  const temp = mkdtempSync(join(tmpdir(), "portkey-magpie-"));
+  try {
+    const configPath = join(temp, "config.json");
+    const plugins = join(temp, "plugins.json");
+    // The name the plugin looks its entry up by is the package's own, so it
+    // is read from package.json rather than repeated here.
+    const name = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).name as string;
+    const switches = (config: PortkeyConfig) => ({ log: config.log, retry: config.retry, cacheTtl1h: config.cacheTtl1h });
+    const load = (logged: string[] = []) =>
+      loadConfig(configPath, MODELS, (m) => logged.push(m), readMagpieOptions(plugins, name, (m) => logged.push(m)));
+    const writeOptions = (options: unknown, spec: unknown = name) =>
+      writeFileSync(plugins, JSON.stringify({ plugins: [{ spec, target: root, options }] }));
+
+    // No file, as in plain pi: the config file alone, and it has nothing.
+    writeFileSync(configPath, "{}");
+    assert.deepEqual(switches(load()), DEFAULT_SWITCHES);
+    // The config file…
+    writeFileSync(configPath, JSON.stringify({ log: true, retry: 2 }));
+    assert.deepEqual(switches(load()), { log: true, retry: 2, cacheTtl1h: false });
+    // …and magpie's options over it, each switch on its own.
+    writeOptions({ log: false, retry: 4 });
+    assert.deepEqual(switches(load()), { log: false, retry: 4, cacheTtl1h: false });
+    writeOptions({ cacheTtl1h: true });
+    assert.deepEqual(switches(load()), { log: true, retry: 2, cacheTtl1h: true });
+
+    // Only this plugin's entry is read: another plugin's options, or an
+    // entry with none, leave the config file's.
+    writeOptions({ log: false, retry: 5 }, "some-other-plugin");
+    assert.deepEqual(switches(load()), { log: true, retry: 2, cacheTtl1h: false });
+    writeOptions(undefined);
+    assert.deepEqual(switches(load()), { log: true, retry: 2, cacheTtl1h: false });
+    // A file that is not magpie's list at all is no override, and is said.
+    writeFileSync(plugins, "{ not json");
+    const logged: string[] = [];
+    assert.deepEqual(switches(load(logged)), { log: true, retry: 2, cacheTtl1h: false });
+    assert.match(logged.at(-1)!, /ignoring magpie's plugin options/);
+    rmSync(plugins);
+
+    // A mistyped switch is refused rather than dropped in silence, or a
+    // user who believes logging off would have it on.
+    writeOptions({ logs: false });
+    const warned: string[] = [];
+    assert.deepEqual(switches(load(warned)), { log: true, retry: 2, cacheTtl1h: false });
+    assert.match(warned.at(-1)!, /unknown field logs \(known: log, retry, cacheTtl1h\)/);
+    writeOptions({ retry: 9 });
+    load(warned);
+    assert.match(warned.at(-1)!, /retry must be a whole number from 0 to 5/);
+
+    // magpie's options still count when the config file is set aside.
+    writeOptions({ retry: 1 });
+    writeFileSync(configPath, "{ not json");
+    assert.deepEqual(switches(load()), { log: false, retry: 1, cacheTtl1h: false });
+  } finally { rmSync(temp, { recursive: true }); }
 });

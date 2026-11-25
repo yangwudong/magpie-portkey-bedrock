@@ -2,6 +2,7 @@
 import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { accountFormOf, BASE_URL_ENV, BASE_URL_HEADER, PROVIDER_ENV, resolveTemplateHeaders } from "./account.ts";
 import type { ModelConfig, PortkeyConfig } from "./config.ts";
+import { modelListRefusal } from "./errors.ts";
 
 // The minimal shape of pi's RefreshModelsContext this extension uses. Kept
 // structural so it stays assignable to the real contract.
@@ -80,6 +81,7 @@ export async function discoverGatewayModels(
   config: PortkeyConfig,
   context: GatewayModelContext,
   send: typeof fetch = globalThis.fetch,
+  log: (message: string) => void = console.error,
 ): Promise<ProviderModelConfig[]> {
   const catalog = () => toProviderModels(config.models, config.headers);
   if (!context.allowNetwork || context.signal.aborted) return catalog();
@@ -98,14 +100,36 @@ export async function discoverGatewayModels(
     signal: context.signal,
   });
   if (!res.ok) {
-    // Gateways that don't expose a model list are fine: keep the catalog quietly.
-    if (res.status === 403 || res.status === 404) return catalog();
+    // A gateway without a model list is fine, and so is one that answers
+    // nothing here. A refusal is not: the catalog stays, and the reason goes
+    // to the log, so a key that cannot list models does not look like a
+    // gateway that simply has no models.
+    if (res.status === 404) return catalog();
+    if (res.status === 403) {
+      log(`portkey-bedrock: ${modelListRefusal(403, await res.text())}`);
+      return catalog();
+    }
     throw new Error(`portkey-bedrock: GET ${base}/models answered ${res.status}`);
   }
 
-  const body = await res.json();
-  const entries = Array.isArray(body?.data) ? body.data : Array.isArray(body) ? body : [];
-  if (!entries.length) throw new Error(`portkey-bedrock: GET ${base}/models returned no models`);
+  // A refusal can also arrive in a 200: the gateway wraps what the upstream
+  // answered, as it does for an IAM denial, and then the list is not a list.
+  const text = await res.text();
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = undefined;
+  }
+  const entries = Array.isArray((body as { data?: unknown } | null)?.data)
+    ? (body as { data: unknown[] }).data
+    : Array.isArray(body)
+      ? body
+      : [];
+  if (!entries.length) {
+    log(`portkey-bedrock: ${modelListRefusal(res.status, text)}`);
+    return catalog();
+  }
 
   const merged = catalog();
   const known = new Set(merged.map((model) => model.id));

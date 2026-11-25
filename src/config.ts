@@ -44,6 +44,48 @@ export interface ModelConfig {
 export interface PortkeyConfig {
   headers: Record<string, string>;
   models: ModelConfig[];
+  /** Whether Portkey may store request and response content in its logs. Off by default. */
+  log: boolean;
+  /** Gateway-side retries on 429/5xx: how many attempts after the first, 0 for none. */
+  retry: number;
+  /** Ask Bedrock's one-hour prompt-cache TTL on Claude models that support it, instead of the 5-minute default. */
+  cacheTtl1h: boolean;
+}
+
+// The switches, by name, with what a value must be: each is read the same way
+// from the config file and from magpie's plugin options, so the two agree.
+const SWITCHES = {
+  log: { boolean: true },
+  retry: { whole: 5 },
+  cacheTtl1h: { boolean: true },
+} as const;
+type SwitchName = keyof typeof SWITCHES;
+// The switches as the config carries them, any of them left out.
+type Switches = Pick<PortkeyConfig, SwitchName>;
+type SomeSwitches = Partial<Switches>;
+
+export const DEFAULT_SWITCHES = { log: false, retry: 0, cacheTtl1h: false } as const;
+
+// Checks one source's switches and names the bad one; a source that says
+// nothing about a switch leaves it to the next. A name that is no switch is
+// refused too: a mistyped one (`logs`) would otherwise be dropped in
+// silence, and a switch the user believes off stay as it was.
+function readSwitches(raw: Record<string, unknown>, where: string, only: boolean): SomeSwitches {
+  const out: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(raw)) {
+    if (!(name in SWITCHES)) {
+      if (only) throw new Error(`${where}: unknown field ${name} (known: ${Object.keys(SWITCHES).join(", ")})`);
+      continue;
+    }
+    if (value === undefined) continue;
+    const rule = SWITCHES[name as SwitchName];
+    if ("boolean" in rule && typeof value !== "boolean") throw new Error(`${where}: ${name} must be true or false`);
+    if ("whole" in rule && (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > rule.whole)) {
+      throw new Error(`${where}: ${name} must be a whole number from 0 to ${rule.whole}`);
+    }
+    out[name] = value;
+  }
+  return out as SomeSwitches;
 }
 
 function readModels(value: unknown, configPath: string): ModelConfig[] {
@@ -137,7 +179,13 @@ function readJsonFile(path: string): unknown {
 // brings its own from its sign-in — so `baseUrl` and `provider` left in the
 // file by earlier versions are ignored. No file means no shared settings.
 // configPath null means no shared settings at all: the catalog alone.
-export function readConfig(configPath: string | null = defaultConfigPath(), modelsPath = MODELS_PATH): PortkeyConfig {
+// `over` are switches set above the file (magpie's plugin options); each one
+// it names wins over the file's, and the rest come from the file.
+export function readConfig(
+  configPath: string | null = defaultConfigPath(),
+  modelsPath = MODELS_PATH,
+  over: SomeSwitches = {},
+): PortkeyConfig {
   const value = configPath && existsSync(configPath) ? readJsonFile(configPath) : {};
   const where = configPath ?? "config";
 
@@ -154,6 +202,10 @@ export function readConfig(configPath: string | null = defaultConfigPath(), mode
   if (raw.configId !== undefined && typeof raw.configId !== "string") {
     throw new Error(`${where}: configId must be a string`);
   }
+  // Portkey's "DO NOT TRACK" is among these: with x-portkey-debug false the
+  // gateway keeps only tokens, cost and latency for a request, never its
+  // content. Off by default, so nothing is stored unless asked for.
+  const switches: Switches = { ...DEFAULT_SWITCHES, ...readSwitches(raw, where, false), ...over };
 
   const headers = readHeaders(raw.headers, where);
   // Routing is per account: each signed-in account's base URL and provider
@@ -171,7 +223,43 @@ export function readConfig(configPath: string | null = defaultConfigPath(), mode
     ? []
     : readModels(raw.models, where);
   const ids = new Set(extra.map((model) => model.id));
-  return { headers, models: [...catalog.filter((model) => !ids.has(model.id)), ...extra] };
+  return { headers, models: [...catalog.filter((model) => !ids.has(model.id)), ...extra], ...switches };
+}
+
+// magpie's Plugins page gives a provider plugin an Options editor (shown
+// once package.json suggests some in magpie.options). What it saves goes to
+// plugins.json in magpie's configuration folder, beside this plugin's own
+// config file, and the host is restarted. magpie hands those options only to
+// its native plugins, so a pi extension reads the file itself; in plain pi
+// there is none, and the config file alone is read. PORTKEY_BEDROCK_PLUGINS
+// points elsewhere, as PORTKEY_BEDROCK_CONFIG does, so tests stay off the
+// user's own file.
+export function MAGPIE_PLUGINS_PATH(home: string = homedir()): string {
+  return process.env.PORTKEY_BEDROCK_PLUGINS || join(home, ".config", "magpie", "plugins.json");
+}
+
+// This plugin's entry in magpie's plugins.json, by its own name; its
+// switches, checked as the config file's are. A file that cannot be read is
+// no override: it is magpie's, not this plugin's to fail on.
+export function readMagpieOptions(
+  pluginsPath = MAGPIE_PLUGINS_PATH(),
+  name: string,
+  log: (message: string) => void = console.error,
+): SomeSwitches {
+  if (!existsSync(pluginsPath)) return {};
+  try {
+    const list = readJsonFile(pluginsPath) as { plugins?: Array<{ spec?: unknown; options?: unknown }> } | null;
+    const entry = Array.isArray(list?.plugins)
+      ? list.plugins.find((plugin) => plugin?.spec === name)
+      : undefined;
+    const options = entry?.options;
+    if (!options || typeof options !== "object" || Array.isArray(options)) return {};
+    // Only switches belong there, so anything else is a slip worth naming.
+    return readSwitches(options as Record<string, unknown>, `${pluginsPath}: ${name} options`, true);
+  } catch (error) {
+    log(`portkey-bedrock: ignoring magpie's plugin options, using the config file only: ${formatError(error)}`);
+    return {};
+  }
 }
 
 // What the plugin loads at start: a config that cannot be read (bad JSON, a
@@ -179,15 +267,18 @@ export function readConfig(configPath: string | null = defaultConfigPath(), mode
 // looks like the plugin vanishing. The catalog alone is used instead and the
 // reason goes to the log (magpie's host sends console output there). The
 // bundled models.json is not covered: a broken one is a packaging bug.
+// magpie's plugin options are read first, so they still count when the file
+// is set aside.
 export function loadConfig(
   configPath = defaultConfigPath(),
   modelsPath = MODELS_PATH,
   log: (message: string) => void = console.error,
+  over: SomeSwitches = {},
 ): PortkeyConfig {
   try {
-    return readConfig(configPath, modelsPath);
+    return readConfig(configPath, modelsPath, over);
   } catch (error) {
     log(`portkey-bedrock: ignoring ${configPath}, using the built-in catalog only: ${formatError(error)}`);
-    return readConfig(null, modelsPath);
+    return readConfig(null, modelsPath, over);
   }
 }

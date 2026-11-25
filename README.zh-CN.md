@@ -25,6 +25,7 @@ English documentation: [README.md](./README.md)
 - input/output/cache-read/cache-write token 用量统计，按目录价计算成本。
 - 取消、请求超时、载荷检查和响应钩子。
 - HTTP 状态码和重试头转发给 magpie，接入它的路由与故障切换。
+- Portkey 拒绝请求时，报错会用它自己的话说明原因（预算耗尽、key 缺少 scope、AWS 主体缺少 IAM 权限），并带上这次请求的 Portkey trace id。
 
 ## 在 magpie 里安装
 
@@ -63,18 +64,38 @@ magpie 会按需安装 Bun、插件的运行时依赖和它的 pi 运行时。�
 
 无需任何配置：每个账号的网关和路由都来自它的登录表单，包里也不带配置文件。
 
-如果网关需要所有账号共用的设置，可以写进可选的 `~/.config/magpie/portkey-bedrock/config.json`。它在已安装插件目录之外，更新插件不会动它。旧版本放在 `index.ts` 旁的 `config.local.json` 在新文件不存在时仍会读取；请把它挪过去，因为更新插件可能会删掉它：
+### 三个开关
+
+有三项设置对所有账号生效，默认都关，可以在两个地方设置：**magpie 的 Options 里设了的，优先于配置文件；配置文件优先于默认值。**
+
+**在 magpie 里：插件 → Portkey Bedrock 那一行 → Options。** 会打开一个带这三个开关的 JSON 框，改完保存，magpie 会重启插件。不用打开任何文件，也不用找路径。
+
+**在配置文件里**（纯 pi，或者想手写）：`~/.config/magpie/portkey-bedrock/config.json`。它在已安装插件目录之外，更新插件不会动它。旧版本放在 `index.ts` 旁的 `config.local.json` 在新文件不存在时仍会读取；请把它挪过去，因为更新插件可能会删掉它：
 
 ```json
 {
   "configId": "pc-your-config",
+  "log": false,
+  "retry": 0,
+  "cacheTtl1h": false,
   "headers": { "x-portkey-trace-id": "magpie" }
 }
 ```
 
+- `log`：是否允许 Portkey 把请求和响应的**内容**存进它的日志。**默认关。** 关闭时每个请求都带 `x-portkey-debug: false`（Portkey 的 "DO NOT TRACK"）：网关仍记录 token、费用和延迟，但不存你的 prompt 和回复。打开后 Portkey 会保存完整的请求和响应内容。如果你在 `headers` 里自己写了 `x-portkey-debug`，以你的为准。
+
+  > [!NOTE]
+  > Portkey 的文档只针对它的 `/v1/chat/completions` 路由描述了这个头；本 provider 在 `/model/{id}/converse-stream` 上同样发送它。托管网关在这条路由上是否遵守，文档没有说明：启用 provider 后请在 Portkey 的 Logs 页面查看一条请求确认；只有在你接受完整内容被保存时才打开 `log`。这个开关不会去掉用量记录（token、费用、延迟），只去掉请求和响应内容。
+- `retry`：Bedrock 返回 `429` 或 `5xx` 时，**Portkey 网关自己**向上游重试几次，范围 `0` 到 `5`。**默认 `0`**，失败会立刻交给 magpie，由它的故障切换决定下一步。打开后网关按指数退避重试，并按 Bedrock 的 `Retry-After` 等待；一直失败的请求，要更久才会报错。它是以内联 `x-portkey-config` 发送的，所以设了 `configId`、或 `headers` 里有这个头时，它会退让：这种情况下请把 `retry` 写进那个保存的配置里。
+- `cacheTtl1h`：让 Claude 的 prompt-cache 检查点保留**一小时**，而不是 Bedrock 默认的五分钟，这样隔一会儿回到对话时还能命中缓存。默认关；只对 Claude 生效（Nova 自己会缓存，五分钟）。Portkey 文档里写明支持一小时 TTL 的是 Claude Opus 4.5、Sonnet 4.5 和 Haiku 4.5；你用的 Bedrock 模型是否接受，需要你自己确认，因为目录里还有 Portkey 表格没列的更新型号。调用方自己的 `cacheRetention` 仍然优先：`none` 不发检查点，`long` 无论开关如何都要求一小时。
+
+文件里的其余设置：
+
 - `configId`：随所有账号请求发送的 `x-portkey-config` 配置 id。
 - `headers`：随所有账号请求发送的额外非敏感网关头。
 - `models`：网关 `/models` 列表里不显示、但能直接按 id 调用的隐藏模型（如 `["us.anthropic.claude-fable-5-2"]`）。条目格式同 `models.json`；它们总会被注册，与目录同 id 的条目会覆盖目录里的那个。
+
+在 magpie 的 Options 里把开关名拼错（比如把 `log` 写成 `logs`）会被拒绝，原因写进 magpie 的日志，而不是被悄悄忽略——否则你以为关掉的开关其实还开着。配置文件里出现非开关的名字则没关系，因为它不只放开关。
 
 旧版本文件里的 `baseUrl` 和 `provider` 会被忽略——它们已不决定任何路由。凭证只放在 magpie 的登录里，不进这个文件：读取器会拒绝 API key 和敏感头（`apiKey`、`virtualKey`、`authorization`、`*-api-key`、`token`、`secret`、`cookie`）。改完重启插件生效。
 
@@ -86,7 +107,14 @@ magpie 会按需安装 Bun、插件的运行时依赖和它的 pi 运行时。�
 
 `models.json` 是可编辑的目录。条目可以是模型 ID 字符串，或带 `id`、`name`、`reasoning`、`thinkingLevelMap`、`input`、`contextWindow`、`maxTokens`、`cost` 的对象。价格是 USD / 百万 token，`input`、`output`、`cacheRead`、`cacheWrite` 分列。条目没写的字段按模型系列取默认值：Anthropic 与 Nova Pro / Premier 开启推理、支持图片、1M 上下文、64K 输出；其他系列只支持文本、不开推理、200K 上下文、8K 输出。价格默认为 0。
 
-内置目录覆盖当前 Bedrock 主力型号，外加常见的 Amazon / DeepSeek / Meta / Mistral 模型。可用性、上限和价格取决于你的 AWS 账号和 Portkey 路由，请按需调整目录。账号登录后，magpie 会通过 provider 的 `refreshModels` 刷新列表：网关 `/models` 的响应与目录合并——目录条目保留自己的元数据，未知 id 以保守默认值加入。
+内置目录覆盖当前 Bedrock 主力型号，外加常见的 Amazon / DeepSeek / Meta / Mistral 模型。可用性、上限和价格取决于你的 AWS 账号和 Portkey 路由，请按需调整目录。账号登录后，magpie 会通过 provider 的 `refreshModels` 刷新列表：网关 `/models` 的响应与目录合并——目录条目保留自己的元数据，未知 id 以保守默认值加入。目录里的 `name` 是 magpie 模型选择器显示的名字（如 `Claude Opus 5.5`，而不是原始 Bedrock id）；请求用的仍然是 id。
+
+网关不肯列出模型时，目录保留，原因写进 magpie 的日志，而不是让刷新失败：
+
+- Portkey 自己的拒绝（例如 `403` 带 `Error Code: 033`）：API key 可能没有列出模型的 scope（`completions.write`），或者 provider slug 属于另一个 workspace。
+- AWS 的拒绝，指明了 IAM action（例如 `bedrock:ListFoundationModels`）：路由背后的 AWS 主体没有这个权限。对话不受影响；可以在 AWS 里放行，或者直接在 `config.json` 的 `models` 里手动列出（见上文）。
+
+其它失败（`5xx`、不是网关自己给出的错误）只报告状态码和网关的原话，不加建议：里面没有你能据以行动的信息。
 
 | 名称 | 模型 id | 上下文 | 最大输出 |
 | --- | --- | ---: | ---: |

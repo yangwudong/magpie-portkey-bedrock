@@ -41,43 +41,61 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
   await once(upstream, "listening");
   const port = (upstream.address() as { port: number }).port;
   // Routing comes from each account's sign-in form, so the test needs no
-  // config file — and never touches the user's own config file.
+  // config file — and never touches the user's own files: neither that nor
+  // magpie's plugin list, which the test writes its own copy of below.
   writeFileSync(join(temp, "auth.json"), "{}");
-  const child = spawn(process.env.BUN_BIN ?? "bun", [join(source!, "internal/plugin/host.js")], {
-    cwd: temp,
-    env: { ...process.env, DO_NOT_TRACK: "1" },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  let stderr = "";
-  child.stderr.on("data", (data) => { stderr = (stderr + data).slice(-16000); });
-  type Pending = { resolve: (value: any) => void; reject: (error: Error) => void; frames: any[]; timer: ReturnType<typeof setTimeout> };
-  const pending = new Map<number, Pending>();
-  let id = 0;
-  const lines = createInterface({ input: child.stdout });
-  lines.on("line", (line) => {
-    const msg = JSON.parse(line);
-    const call = pending.get(msg.id);
-    if (!call) return;
-    if (msg.event) { call.frames.push(msg); return; }
-    clearTimeout(call.timer);
-    pending.delete(msg.id);
-    if (msg.error) call.reject(new Error(msg.error.message));
-    else call.resolve({ result: msg.result, frames: call.frames });
-  });
-  child.on("exit", (code) => {
-    for (const call of pending.values()) {
-      clearTimeout(call.timer); call.reject(new Error(`Magpie host exited ${code}: ${stderr}`));
-    }
-    pending.clear();
-  });
-  function rpc(method: string, params: unknown = {}): Promise<any> {
-    const key = ++id;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { pending.delete(key); reject(new Error(`Magpie ${method} timed out: ${stderr}`)); }, 25000);
-      pending.set(key, { resolve, reject, frames: [], timer });
-      child.stdin.write(JSON.stringify({ id: key, method, params }) + "\n");
+  const pluginsPath = join(temp, "plugins.json");
+  // One host process and a way to talk to it. magpie restarts the host for
+  // real after saving a plugin's options (a new process, so nothing a plugin
+  // kept from its last run survives), and the test starts one the same way.
+  type Host = { child: ReturnType<typeof spawn>; rpc: (method: string, params?: unknown) => Promise<any>; stderr: () => string; stop: () => void };
+  function startHost(): Host {
+    const child = spawn(process.env.BUN_BIN ?? "bun", [join(source!, "internal/plugin/host.js")], {
+      cwd: temp,
+      env: { ...process.env, DO_NOT_TRACK: "1", PORTKEY_BEDROCK_PLUGINS: pluginsPath },
+      stdio: ["pipe", "pipe", "pipe"],
     });
+    let stderr = "";
+    child.stderr.on("data", (data) => { stderr = (stderr + data).slice(-16000); });
+    type Pending = { resolve: (value: any) => void; reject: (error: Error) => void; frames: any[]; timer: ReturnType<typeof setTimeout> };
+    const pending = new Map<number, Pending>();
+    let id = 0;
+    const lines = createInterface({ input: child.stdout });
+    lines.on("line", (line) => {
+      const msg = JSON.parse(line);
+      const call = pending.get(msg.id);
+      if (!call) return;
+      if (msg.event) { call.frames.push(msg); return; }
+      clearTimeout(call.timer);
+      pending.delete(msg.id);
+      if (msg.error) call.reject(new Error(msg.error.message));
+      else call.resolve({ result: msg.result, frames: call.frames });
+    });
+    const stop = () => {
+      for (const call of pending.values()) clearTimeout(call.timer);
+      pending.clear();
+      child.kill();
+      lines.close();
+    };
+    child.on("exit", (code) => {
+      for (const call of pending.values()) {
+        clearTimeout(call.timer); call.reject(new Error(`Magpie host exited ${code}: ${stderr}`));
+      }
+      pending.clear();
+    });
+    function rpc(method: string, params: unknown = {}): Promise<any> {
+      const key = ++id;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { pending.delete(key); reject(new Error(`Magpie ${method} timed out: ${stderr}`)); }, 25000);
+        pending.set(key, { resolve, reject, frames: [], timer });
+        child.stdin.write(JSON.stringify({ id: key, method, params }) + "\n");
+      });
+    }
+    return { child, rpc, stderr: () => stderr, stop };
   }
+  const stderr = () => host.stderr();
+  const host: Host = startHost();
+  const rpc = (method: string, params?: unknown) => host.rpc(method, params);
   const model = "us.anthropic.claude-opus-4-8";
   async function ask(body: Record<string, unknown> = {}, account?: string) {
     const response = await rpc("fetch", {
@@ -128,7 +146,7 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
   }
   try {
     const init = await rpc("init", { directory: temp, authPath: join(temp, "auth.json"), piPath: join(source!, "internal/plugin/pi.js"), plugins: [{ spec: root, target: root }] });
-    assert.equal(init.result.plugins[0].error, undefined, init.result.plugins[0].error ?? stderr);
+    assert.equal(init.result.plugins[0].error, undefined, init.result.plugins[0].error ?? stderr());
     assert.deepEqual(init.result.plugins[0].provides, ["portkey-bedrock"]);
     const { result: providers } = await rpc("providers");
     assert.equal(providers[0].models.length, 15);
@@ -138,7 +156,7 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
     // The signed-in account triggers the model refresh: the gateway's list is
     // merged into the catalog.
     const listed = await rpc("providers");
-    assert.equal(listed.result[0].models.length, 16, stderr);
+    assert.equal(listed.result[0].models.length, 16, stderr());
     assert.ok(listed.result[0].models.some((m: any) => m.id === "vendor.discovered-v1:0"));
     const listedRequest = requests.find((r) => r.body === null);
     assert.ok(listedRequest, "the gateway was asked for its model list");
@@ -218,10 +236,49 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
     const after = JSON.parse(readFileSync(join(temp, "auth.json"), "utf8"));
     assert.equal(Object.keys(after).filter((k) => k.startsWith("portkey-bedrock")).length, 2);
     assert.equal(after["portkey-bedrock"].access, "third-test-key");
+
+    // magpie's plugin options, as its Plugins page's Options editor saves
+    // them: in plugins.json, and then the host restarted. A pi extension is
+    // handed nothing of them, so it reads the file itself as it starts. The
+    // switches are to show on the request as headers.
+    const writeOptions = (options: Record<string, unknown>) =>
+      writeFileSync(pluginsPath, JSON.stringify({ plugins: [{ spec: "@jack-yang/magpie-portkey-bedrock", target: root, options }] }));
+    const start = async () => {
+      host.stop();
+      Object.assign(host, startHost());
+      const loaded = await rpc("init", { directory: temp, authPath: join(temp, "auth.json"), piPath: join(source!, "internal/plugin/pi.js"), plugins: [{ spec: root, target: root }] });
+      assert.equal(loaded.result.plugins[0].error, undefined, loaded.result.plugins[0].error ?? stderr());
+    };
+    const lastHeaders = () => requests.at(-1)!.headers;
+    status = 200;
+    events = textEvents();
+    // Off, as the plugin ships: no content in Portkey's logs, no gateway retry.
+    writeOptions({});
+    await start();
+    await ask();
+    assert.equal(lastHeaders()["x-portkey-debug"], "false");
+    assert.equal(lastHeaders()["x-portkey-config"], undefined);
+    // On: each shows on the request made after the restart.
+    writeOptions({ log: true, retry: 3, cacheTtl1h: true });
+    await start();
+    const on = await ask();
+    assert.equal(on.head.status, 200, on.data);
+    assert.equal(lastHeaders()["x-portkey-debug"], undefined);
+    assert.deepEqual(JSON.parse(lastHeaders()["x-portkey-config"]), { retry: { attempts: 3, use_retry_after_headers: true } });
+    assert.deepEqual(requests.at(-1)!.body.system.at(-1), { cachePoint: { type: "default", ttl: "1h" } });
+    // Back off again: a restart with the switches gone returns to the defaults.
+    writeOptions({ retry: 1 });
+    await start();
+    await ask();
+    assert.equal(lastHeaders()["x-portkey-debug"], "false");
+    assert.deepEqual(JSON.parse(lastHeaders()["x-portkey-config"]), { retry: { attempts: 1, use_retry_after_headers: true } });
+    // A switch magpie saved that this plugin does not know is refused, and
+    // the reason reaches magpie's log: a mistyped one must not pass silently.
+    writeOptions({ logs: false });
+    await start();
+    assert.match(stderr(), /unknown field logs \(known: log, retry, cacheTtl1h\)/);
   } finally {
-    for (const call of pending.values()) clearTimeout(call.timer);
-    child.kill();
-    lines.close();
+    host.stop();
     upstream.closeAllConnections();
     await new Promise<void>((resolve) => upstream.close(() => resolve()));
     rmSync(temp, { recursive: true, force: true });

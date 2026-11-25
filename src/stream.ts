@@ -19,8 +19,9 @@ import {
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { BASE_URL_ENV, BASE_URL_HEADER, resolveTemplateHeaders } from "./account.ts";
+import { DEFAULT_SWITCHES, type PortkeyConfig } from "./config.ts";
 import { bedrockReasoningOptions, cachePointFor, convertMessages, convertTools, mapReasoning } from "./convert.ts";
-import { finishErrorMessage, formatError } from "./errors.ts";
+import { finishErrorMessage, formatError, requestRefusal } from "./errors.ts";
 
 interface StreamBlockState {
   contentIndex: number;
@@ -39,6 +40,28 @@ function providerHeaders(
   return {
     ...configuredHeaders,
     "x-portkey-api-key": portkeyApiKey,
+  };
+}
+
+// The switches that reach the gateway as headers. A header of the same name
+// in the config wins over a switch, so a user can still set one by hand.
+//
+// x-portkey-debug decides whether Portkey stores a request's content. The
+// header is named "debug", but false only drops the request and response
+// bodies; tokens, cost and latency are kept.
+//
+// Retries are the gateway's (Portkey retries the upstream on 429/5xx with
+// backoff, and waits as the provider's Retry-After asks when told to). They
+// go in x-portkey-config as an inline config, which is the one header a
+// saved config id also uses: with a configId set, the switch is left to that
+// config, as replacing it would drop whatever else the saved one holds.
+function switchHeaders(switches: Pick<PortkeyConfig, "log" | "retry">, configured: Record<string, string>): Record<string, string> {
+  const has = (name: string) => Object.keys(configured).some((key) => key.toLowerCase() === name);
+  return {
+    ...(!switches.log && !has("x-portkey-debug") ? { "x-portkey-debug": "false" } : {}),
+    ...(switches.retry > 0 && !has("x-portkey-config")
+      ? { "x-portkey-config": JSON.stringify({ retry: { attempts: switches.retry, use_retry_after_headers: true } }) }
+      : {}),
   };
 }
 
@@ -119,6 +142,7 @@ function streamPortkeyAws(
   context: TranscriptContext,
   options: SimpleStreamOptions | undefined,
   configuredHeaders: Record<string, string>,
+  switches: Pick<PortkeyConfig, "log" | "retry" | "cacheTtl1h">,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
 
@@ -179,6 +203,11 @@ function streamPortkeyAws(
     // A deadline of its own, so a timeout reads as one rather than as an
     // abort the user never asked for or an opaque stream failure.
     const timeout = options?.timeoutMs ? AbortSignal.timeout(options.timeoutMs) : undefined;
+    // What the gateway said about the one request made below, for an error
+    // message: its trace id, to find the request in Portkey, and its own
+    // words when it refused.
+    let traceId: string | undefined;
+    let refusal: string | undefined;
     try {
       const portkeyApiKey = options?.apiKey;
       if (!portkeyApiKey) throw new Error("portkey-bedrock: no account is signed in (Providers → Portkey Bedrock → sign in)");
@@ -208,7 +237,7 @@ function streamPortkeyAws(
         baseURL: accountBaseUrl,
         // Portkey requires both Bearer authentication and its own key header.
         apiKey: portkeyApiKey,
-        headers: providerHeaders(portkeyApiKey, configured),
+        headers: providerHeaders(portkeyApiKey, { ...configured, ...switchHeaders(switches, configured) }),
         fetch: async (url, init) => {
           if (options?.onPayload && typeof init?.body === "string") {
             const payload: unknown = JSON.parse(init.body);
@@ -216,6 +245,12 @@ function streamPortkeyAws(
             init = { ...init, body: JSON.stringify(replacement ?? payload) };
           }
           const response = await send(url, init);
+          traceId = response.headers.get("x-portkey-trace-id") ?? undefined;
+          // A refusal is the gateway's own: read its body once here, since
+          // the SDK only keeps the text of an error it recognises.
+          if (!response.ok && response.status !== 429) {
+            refusal = requestRefusal(response.status, await response.clone().text());
+          }
           await options?.onResponse?.({
             status: response.status,
             headers: Object.fromEntries(response.headers),
@@ -226,7 +261,7 @@ function streamPortkeyAws(
 
       const systemPrompt = getCurrentSystemPrompt(context.messages);
       const reasoningOptions = bedrockReasoningOptions(model, options?.reasoning);
-      const cachePoint = cachePointFor(model, options?.cacheRetention);
+      const cachePoint = cachePointFor(model, options?.cacheRetention, switches.cacheTtl1h);
       const result = streamText({
         model: bedrock(model.id as never),
         // Passed as a SystemModelMessage rather than a plain string so it can
@@ -393,9 +428,21 @@ function streamPortkeyAws(
       stream.end();
     } catch (error) {
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-      output.errorMessage = timeout?.aborted && !options?.signal?.aborted
-        ? `portkey-bedrock: the request timed out after ${options!.timeoutMs} ms`
-        : formatError(error);
+      // A timeout or an abort is the user's own doing; only a failure owes
+      // an explanation, and then in the gateway's words where it has any.
+      if (timeout?.aborted && !options?.signal?.aborted) {
+        output.errorMessage = `portkey-bedrock: the request timed out after ${options!.timeoutMs} ms`;
+      } else if (output.stopReason === "error") {
+        // With the gateway's own account of the refusal, the SDK's copy of
+        // the body is left out: it repeats the same words and, for an IAM
+        // denial, the account it names.
+        output.errorMessage = [
+          refusal ?? formatError(error),
+          traceId ? `Portkey trace id: ${traceId}` : undefined,
+        ].filter(Boolean).join(" ");
+      } else {
+        output.errorMessage = formatError(error);
+      }
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();
     }
@@ -404,10 +451,10 @@ function streamPortkeyAws(
   return stream;
 }
 
-export function createPortkeyStream(configuredHeaders: Record<string, string>) {
+export function createPortkeyStream(configuredHeaders: Record<string, string>, switches: Pick<PortkeyConfig, "log" | "retry" | "cacheTtl1h"> = DEFAULT_SWITCHES) {
   return (
     model: Model<Api>,
     context: TranscriptContext,
     options?: SimpleStreamOptions,
-  ): AssistantMessageEventStream => streamPortkeyAws(model, context, options, configuredHeaders);
+  ): AssistantMessageEventStream => streamPortkeyAws(model, context, options, configuredHeaders, switches);
 }

@@ -28,10 +28,17 @@ export type CachePointOptions = { bedrock: { cachePoint: { type: "default"; ttl?
 // Only Claude and Nova accept cachePoint blocks; other families (Llama,
 // Mistral, DeepSeek…) gain nothing from them and may reject the request.
 // "long" asks for Bedrock's one-hour TTL, as pi's native Bedrock adapter does.
-export function cachePointFor(model: Model<Api>, retention: CacheRetention): CachePointOptions | undefined {
+// What the caller asked for stands; `ttl1h` is for a caller that asked for
+// nothing, as magpie's bridge does: on, a checkpoint it did ask for keeps
+// for an hour instead of the five minutes Bedrock defaults to. That is for
+// Claude alone: Nova caches on its own, for five minutes, whatever a
+// checkpoint says.
+export function cachePointFor(model: Model<Api>, retention: CacheRetention, ttl1h = false): CachePointOptions | undefined {
   if (retention === "none") return undefined;
-  if (!/claude|anthropic\.|nova/i.test(`${model.id} ${model.name ?? ""}`)) return undefined;
-  return { bedrock: { cachePoint: { type: "default", ...(retention === "long" ? { ttl: "1h" as const } : {}) } } };
+  const id = `${model.id} ${model.name ?? ""}`;
+  if (!/claude|anthropic\.|nova/i.test(id)) return undefined;
+  const claude = /claude|anthropic\./i.test(id);
+  return { bedrock: { cachePoint: { type: "default", ...(retention === "long" || (ttl1h && claude) ? { ttl: "1h" as const } : {}) } } };
 }
 
 function convertUserContent(content: string | Array<TextContent | ImageContent>): string | Array<TextPart | FilePart> {
