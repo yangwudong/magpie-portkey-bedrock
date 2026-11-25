@@ -46,7 +46,10 @@ export interface PortkeyConfig {
   models: ModelConfig[];
   /** Whether Portkey may store request and response content in its logs. Off by default. */
   log: boolean;
-  /** Gateway-side retries on 429/5xx: how many attempts after the first, 0 for none. */
+  /**
+   * Gateway-side retries: how many more times Portkey asks the same account
+   * when Bedrock answers 429 or a 5xx. 0 for none.
+   */
   retry: number;
   /** Ask Bedrock's one-hour prompt-cache TTL on Claude models that support it, instead of the 5-minute default. */
   cacheTtl1h: boolean;
@@ -64,7 +67,29 @@ type SwitchName = keyof typeof SWITCHES;
 type Switches = Pick<PortkeyConfig, SwitchName>;
 type SomeSwitches = Partial<Switches>;
 
-export const DEFAULT_SWITCHES = { log: false, retry: 0, cacheTtl1h: false } as const;
+// What a switch is when nothing sets it, in this file or magpie's options.
+//
+// retry is 2: a failure is retried on the same account twice before magpie
+// hears of it. That keeps the account's prompt cache, which is lost the
+// moment magpie moves to another account, and it absorbs a brief 429 without
+// one. It costs up to 3 seconds of waiting on a request that keeps failing
+// (Portkey backs off 1s, then 2s: 1s doubled per retry, as its docs table
+// says), and less when Bedrock says how long to wait: Portkey follows
+// Bedrock's Retry-After, and gives up at once when told to wait 60s or more,
+// so an account that is down for long reaches magpie fast. 3 would add 4
+// more seconds for a third try that rarely helps; 0 would lose the cache to
+// magpie's failover on every blip. docs/portkey-reference.md has the sums.
+//
+// log is off: nothing of what is said belongs in Portkey's logs unless
+// asked for. cacheTtl1h is off: an hour's cache is said to cost more to
+// write (none of the documentation read has its price, and neither does
+// models.json, so the cost reported with it on is a lower bound), and it
+// only pays when a conversation is returned to after more than five
+// minutes, which is for each user to know.
+//
+// package.json's magpie.options shows these in magpie's Options editor, and
+// says the same values; the test holds the two together.
+export const DEFAULT_SWITCHES = { log: false, retry: 2, cacheTtl1h: false } as const;
 
 // Checks one source's switches and names the bad one; a source that says
 // nothing about a switch leaves it to the next. A name that is no switch is

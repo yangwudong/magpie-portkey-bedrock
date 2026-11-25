@@ -252,13 +252,15 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
     const lastHeaders = () => requests.at(-1)!.headers;
     status = 200;
     events = textEvents();
-    // Off, as the plugin ships: no content in Portkey's logs, no gateway retry.
+    // As the plugin ships, with nothing saved: no content in Portkey's logs,
+    // and two gateway retries on the same account before magpie hears of a
+    // failure.
     writeOptions({});
     await start();
     await ask();
     assert.equal(lastHeaders()["x-portkey-debug"], "false");
-    assert.equal(lastHeaders()["x-portkey-config"], undefined);
-    // On: each shows on the request made after the restart.
+    assert.deepEqual(JSON.parse(lastHeaders()["x-portkey-config"]), { retry: { attempts: 2, use_retry_after_headers: true } });
+    // Each switch on shows on the request made after the restart.
     writeOptions({ log: true, retry: 3, cacheTtl1h: true });
     await start();
     const on = await ask();
@@ -266,6 +268,11 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
     assert.equal(lastHeaders()["x-portkey-debug"], undefined);
     assert.deepEqual(JSON.parse(lastHeaders()["x-portkey-config"]), { retry: { attempts: 3, use_retry_after_headers: true } });
     assert.deepEqual(requests.at(-1)!.body.system.at(-1), { cachePoint: { type: "default", ttl: "1h" } });
+    // Retry can be turned off for good, and then no retry config is sent.
+    writeOptions({ retry: 0 });
+    await start();
+    await ask();
+    assert.equal(lastHeaders()["x-portkey-config"], undefined);
     // Back off again: a restart with the switches gone returns to the defaults.
     writeOptions({ retry: 1 });
     await start();

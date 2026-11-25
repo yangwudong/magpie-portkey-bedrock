@@ -605,9 +605,10 @@ test("config validation covers headers, models and secret fields", () => {
     assert.equal(read({ log: true }).log, true);
     assert.equal(read({ log: false }).log, false);
     for (const log of ["false", 0, null]) assert.throws(() => read({ log }), /log must be true or false/);
-    // retry and cacheTtl1h: off unless set; retry is 0–5, as Portkey allows
-    // five attempts at the most.
-    assert.equal(read({}).retry, 0);
+    // cacheTtl1h is off unless set. retry is 2 unless set (DEFAULT_SWITCHES
+    // says why) and 0–5, as Portkey allows five attempts at the most.
+    assert.equal(read({}).retry, 2);
+    assert.equal(read({ retry: 0 }).retry, 0);
     assert.equal(read({ retry: 5 }).retry, 5);
     for (const retry of [-1, 6, 1.5, "3", null]) assert.throws(() => read({ retry }), /retry must be a whole number from 0 to 5/);
     assert.equal(read({}).cacheTtl1h, false);
@@ -639,6 +640,16 @@ test("config validation covers headers, models and secret fields", () => {
     assert.equal(read({ models: [] }).models.length, 1);
     assert.throws(() => read({ models: [42] }), /model ID/);
   } finally { rmSync(temp, { recursive: true }); }
+});
+
+// magpie's Options editor opens on package.json's magpie.options when the
+// user has saved nothing. Those are the defaults as the user first sees
+// them, so they have to be the ones the code falls back to: were they to
+// drift, the box would promise one thing and a request do another, until
+// the user saved. Checked here rather than trusted, as two places hold them.
+test("the options magpie's editor opens on are the defaults the code falls back to", () => {
+  const { magpie } = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { magpie: { options?: Record<string, unknown> } };
+  assert.deepEqual(magpie.options, DEFAULT_SWITCHES);
 });
 
 test("the registered provider carries the switches magpie saved under the package's own name", async () => {
@@ -871,9 +882,11 @@ test("the switches reach the gateway as headers, and a header set by hand wins",
   assert.equal((await capture({}, { log: true })).get("x-portkey-debug"), null);
   assert.equal((await capture({ "x-portkey-debug": "true" })).get("x-portkey-debug"), "true");
   assert.equal((await capture({ "X-Portkey-Debug": "false" }, { log: true })).get("x-portkey-debug"), "false");
-  // retry: none by default; on, the gateway retries the upstream itself and
-  // waits as the provider's Retry-After asks.
-  assert.equal((await capture({})).get("x-portkey-config"), null);
+  // retry: two by default, so a failure is tried again on the same account
+  // before magpie moves to another and loses its cache; on, the gateway
+  // retries the upstream itself and waits as the provider's Retry-After
+  // asks. 0 turns it off.
+  assert.deepEqual(JSON.parse((await capture({})).get("x-portkey-config")!), { retry: { attempts: 2, use_retry_after_headers: true } });
   assert.deepEqual(JSON.parse((await capture({}, { retry: 3 })).get("x-portkey-config")!), { retry: { attempts: 3, use_retry_after_headers: true } });
   assert.equal((await capture({}, { retry: 0 })).get("x-portkey-config"), null);
   // A saved config id owns the header: the switch gives way rather than

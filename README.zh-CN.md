@@ -66,7 +66,7 @@ magpie 会按需安装 Bun、插件的运行时依赖和它的 pi 运行时。�
 
 ### 三个开关
 
-有三项设置对所有账号生效，默认都关，可以在两个地方设置：**magpie 的 Options 里设了的，优先于配置文件；配置文件优先于默认值。**
+有三项设置对所有账号生效，可以在两个地方设置：**magpie 的 Options 里设了的，优先于配置文件；配置文件优先于默认值。** `log` 和 `cacheTtl1h` 默认关，`retry` 默认 `2`。每一项为什么是这个默认值、背后的 Portkey 行为是什么，见 [docs/portkey-reference.zh-CN.md](docs/portkey-reference.zh-CN.md)。
 
 **在 magpie 里：插件 → Portkey Bedrock 那一行 → Options。** 会打开一个带这三个开关的 JSON 框，改完保存，magpie 会重启插件。不用打开任何文件，也不用找路径。
 
@@ -76,7 +76,7 @@ magpie 会按需安装 Bun、插件的运行时依赖和它的 pi 运行时。�
 {
   "configId": "pc-your-config",
   "log": false,
-  "retry": 0,
+  "retry": 2,
   "cacheTtl1h": false,
   "headers": { "x-portkey-trace-id": "magpie" }
 }
@@ -86,7 +86,7 @@ magpie 会按需安装 Bun、插件的运行时依赖和它的 pi 运行时。�
 
   > [!NOTE]
   > Portkey 的文档只针对它的 `/v1/chat/completions` 路由描述了这个头；本 provider 在 `/model/{id}/converse-stream` 上同样发送它。托管网关在这条路由上是否遵守，文档没有说明：启用 provider 后请在 Portkey 的 Logs 页面查看一条请求确认；只有在你接受完整内容被保存时才打开 `log`。这个开关不会去掉用量记录（token、费用、延迟），只去掉请求和响应内容。
-- `retry`：Bedrock 返回 `429` 或 `5xx` 时，**Portkey 网关自己**向上游重试几次，范围 `0` 到 `5`。**默认 `0`**，失败会立刻交给 magpie，由它的故障切换决定下一步。打开后网关按指数退避重试，并按 Bedrock 的 `Retry-After` 等待；一直失败的请求，要更久才会报错。它是以内联 `x-portkey-config` 发送的，所以设了 `configId`、或 `headers` 里有这个头时，它会退让：这种情况下请把 `retry` 写进那个保存的配置里。
+- `retry`：Bedrock 返回 `429` 或 `5xx` 时，**Portkey 网关自己**在同一个账号上再多试几次，范围 `0` 到 `5`。**默认 `2`。** 重试留在同一个账号上，它的 prompt 缓存就还在；换成 magpie 故障切换到别的账号，那个账号没有缓存，要重新花写入的钱。代价是一直失败的请求最多多等 3 秒（Portkey 先等 1 秒，再等 2 秒）；Bedrock 说了要等多久时会更短：Portkey 按 Bedrock 的 `Retry-After` 来，要等一分钟以上就直接放弃。设 `0` 则每次失败都立刻交给 magpie。只有 `429` 和 `5xx` 会重试，其它（`400`、`403`、`412`）直接返回。它是以内联 `x-portkey-config` 发送的，所以设了 `configId`、或 `headers` 里有这个头时，它会退让：这种情况下请把 `retry` 写进那个保存的配置里。
 - `cacheTtl1h`：让 Claude 的 prompt-cache 检查点保留**一小时**，而不是 Bedrock 默认的五分钟，这样隔一会儿回到对话时还能命中缓存。默认关；只对 Claude 生效（Nova 自己会缓存，五分钟）。Portkey 文档里写明支持一小时 TTL 的是 Claude Opus 4.5、Sonnet 4.5 和 Haiku 4.5；你用的 Bedrock 模型是否接受，需要你自己确认，因为目录里还有 Portkey 表格没列的更新型号。调用方自己的 `cacheRetention` 仍然优先：`none` 不发检查点，`long` 无论开关如何都要求一小时。
 
 文件里的其余设置：
