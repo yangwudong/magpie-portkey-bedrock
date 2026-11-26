@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -235,24 +235,111 @@ test("payload replacement, tool-choice none and observer errors", async () => {
   assert.equal(captured.body.toolConfig, undefined);
 });
 
-test("HTTP refusal reaches onResponse for Magpie failover without retries", async () => {
-  let calls = 0;
+test("a failure that may pass is sent again on the same account, and the last reply reaches magpie", async () => {
+  // Retrying here, not in Portkey's gateway: the gateway's retry takes an
+  // inline x-portkey-config, which a Portkey organization blocking inline
+  // configs refuses, and which replaces a default config on the API key.
+  // The same account, so its prompt cache is read again; magpie moving to
+  // another account starts with none.
+  const throttled = () => new Response(JSON.stringify({ message: "Slow down", type: "throttlingException" }), { status: 429, headers: { "retry-after": "0", "content-type": "application/json" } });
+  const sent: Array<{ body: string; headers: Headers }> = [];
   let response;
-  const { message } = await ask([], context, {
-    fetch: async () => { calls++; return new Response(JSON.stringify({ message: "Slow down", type: "throttlingException" }), { status: 429, headers: { "retry-after": "7", "content-type": "application/json" } }); },
+  const keep = (init?: RequestInit) => { sent.push({ body: String(init?.body), headers: new Headers(init?.headers) }); };
+  // Every try refused: retried twice by default, and magpie is handed the
+  // last 429 and its Retry-After, so its own failover still works.
+  const failed = await ask([], context, {
+    fetch: async (_url, init) => { keep(init); return throttled(); },
     onResponse: (r) => { response = r; },
   });
+  assert.equal(sent.length, 3);
+  assert.equal(failed.message.stopReason, "error");
+  assert.match(failed.message.errorMessage!, /HTTP 429/);
+  assert.deepEqual(response, { status: 429, headers: { "content-type": "application/json", "retry-after": "0" } });
+  // Each try is the same request, and none asks the gateway to retry.
+  assert.ok(sent.every((s) => s.body === sent[0].body));
+  assert.ok(sent.every((s) => s.headers.get("x-portkey-config") === "test-config"));
+  // Refused once, then served: the answer comes through, and magpie hears of
+  // the success only.
+  sent.length = 0;
+  const served = await ask(textEvents(), context, {
+    fetch: async (_url, init) => { keep(init); return sent.length === 1 ? throttled() : wireResponse(textEvents()); },
+    onResponse: (r) => { response = r; },
+  });
+  assert.equal(sent.length, 2);
+  assert.equal(served.message.stopReason, "stop", served.message.errorMessage ?? "");
+  assert.equal((response as any).status, 200);
+});
+
+test("only a failure that may pass is retried, and only for as long as it may", async () => {
+  const count = async (reply: () => Response, switches: Partial<Pick<PortkeyConfig, "retry">> = {}) => {
+    let calls = 0;
+    const stream = createPortkeyStream({}, { ...DEFAULT_SWITCHES, ...switches })(model, normalizeContext(context), {
+      apiKey: "k", headers: accountGateway,
+      fetch: async () => { calls++; return reply(); },
+    });
+    await stream.result();
+    return calls;
+  };
+  const status = (code: number, headers: Record<string, string> = {}) => () =>
+    new Response(JSON.stringify({ message: "no" }), { status: code, headers: { "content-type": "application/json", "retry-after": "0", ...headers } });
+  // Sent again: rate limited, timed out, the upstream failing.
+  for (const code of [429, 408, 500, 502, 503, 504, 529]) assert.equal(await count(status(code)), 3, `HTTP ${code}`);
+  // Not sent again: the request itself is refused, and would be again.
+  for (const code of [400, 401, 403, 404, 412, 446]) assert.equal(await count(status(code)), 1, `HTTP ${code}`);
+  // retry 0: one try; 5: six.
+  assert.equal(await count(status(429), { retry: 0 }), 1);
+  assert.equal(await count(status(429), { retry: 5 }), 6);
+  // A wait of a minute or more is not waited: magpie hears of it at once and
+  // can try another account.
+  assert.equal(await count(status(429, { "retry-after": "60" })), 1);
+  assert.equal(await count(status(429, { "retry-after-ms": "120000" })), 1);
+});
+
+test("the waits between tries follow Retry-After, else back off from a second, and an abort ends them", async () => {
+  const waits: number[] = [];
+  const realSetTimeout = globalThis.setTimeout;
+  // Record the waits asked for, and wait none of them.
+  globalThis.setTimeout = ((fn: () => void, ms?: number) => { if (ms && ms >= 500) waits.push(ms); return realSetTimeout(fn, 0); }) as typeof setTimeout;
+  try {
+    const run = async (headers: Record<string, string>, retry = 3) => {
+      waits.length = 0;
+      const stream = createPortkeyStream({}, { ...DEFAULT_SWITCHES, retry })(model, normalizeContext(context), {
+        apiKey: "k", headers: accountGateway,
+        fetch: async () => new Response("{}", { status: 503, headers }),
+      });
+      await stream.result();
+      return [...waits];
+    };
+    // No word from the upstream: 1s, 2s, 4s.
+    assert.deepEqual(await run({}), [1000, 2000, 4000]);
+    // Its word, in seconds or milliseconds.
+    assert.deepEqual(await run({ "retry-after": "3" }, 2), [3000, 3000]);
+    assert.deepEqual(await run({ "retry-after-ms": "1500" }, 2), [1500, 1500]);
+    // More than a minute of waiting in all is not waited: 25s, 25s, then a
+    // third 25s would pass a minute, so magpie hears of it instead.
+    assert.deepEqual(await run({ "retry-after": "25" }), [25000, 25000]);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+  // An abort while waiting ends the request as aborted, at once.
+  const abort = new AbortController();
+  let calls = 0;
+  const started = Date.now();
+  const pending = createPortkeyStream({}, DEFAULT_SWITCHES)(model, normalizeContext(context), {
+    apiKey: "k", headers: accountGateway, signal: abort.signal,
+    fetch: async () => { calls++; realSetTimeout(() => abort.abort(), 20); return new Response("{}", { status: 503, headers: { "retry-after": "30" } }); },
+  }).result();
+  const message = await pending;
+  assert.equal(message.stopReason, "aborted");
   assert.equal(calls, 1);
-  assert.equal(message.stopReason, "error");
-  assert.match(message.errorMessage!, /HTTP 429/);
-  assert.deepEqual(response, { status: 429, headers: { "content-type": "application/json", "retry-after": "7" } });
+  assert.ok(Date.now() - started < 5000, "the 30s wait was not waited out");
 });
 
 test("a failure names the gateway's trace and says why it refused", async () => {
   const refused = async (status: number, body: unknown, headers: Record<string, string> = {}) => {
     const { message } = await ask([], context, {
       fetch: async () => new Response(typeof body === "string" ? body : JSON.stringify(body), {
-        status, headers: { "content-type": "application/json", "x-portkey-trace-id": "trace-abc-123", ...headers },
+        status, headers: { "content-type": "application/json", "x-portkey-trace-id": "trace-abc-123", "retry-after": "0", ...headers },
       }),
     });
     return message.errorMessage ?? "";
@@ -277,7 +364,7 @@ test("a failure names the gateway's trace and says why it refused", async () => 
   assert.doesNotMatch(iam, /123456789012/);
   assert.doesNotMatch(iam, /Chat is unaffected/);
   // Throttling is not a refusal: it keeps the SDK's wording, with the trace.
-  const throttled = await refused(429, { message: "Slow down" }, { "retry-after": "7" });
+  const throttled = await refused(429, { message: "Slow down" });
   assert.doesNotMatch(throttled, /Portkey refused/);
   assert.match(throttled, /HTTP 429/);
   assert.match(throttled, /Portkey trace id: trace-abc-123/);
@@ -294,6 +381,33 @@ test("a failure names the gateway's trace and says why it refused", async () => 
   assert.match(down, /Portkey trace id: trace-abc-123/);
   // Nothing quoted, nothing shown as quoted.
   assert.doesNotMatch(await refused(403, null), /""/);
+  // An organization's Block Inline Configs, with the body Portkey documents
+  // for it: the code is named, and so is the setting the user changes.
+  const blocked = (code: string, field: string) => ({
+    status: "failure",
+    error: { code, message: `Inline ${field} is not allowed when saved-only mode is enabled.`, field },
+    message: `Inline ${field} is not allowed when saved-only mode is enabled.`,
+  });
+  const provider = await refused(400, blocked("inline_provider_blocked", "x-portkey-provider"));
+  assert.match(provider, /^Portkey refused the request: inline_provider_blocked \(HTTP 400\)/);
+  assert.match(provider, /@your-provider/);
+  assert.match(provider, /Portkey trace id: trace-abc-123/);
+  const config = await refused(400, blocked("inline_config_blocked", "x-portkey-config"));
+  assert.match(config, /inline_config_blocked/);
+  assert.match(config, /configId/);
+  assert.match(await refused(400, blocked("inline_forward_headers_blocked", "x-portkey-forward-headers")), /forward_headers/);
+  assert.match(await refused(400, blocked("inline_custom_host_blocked", "x-portkey-custom-host")), /custom host/);
+  // A Bedrock 400 is not Portkey's policy, and keeps the SDK's wording.
+  const invalid = await refused(400, { message: "messages: field required", type: "validationException" });
+  assert.doesNotMatch(invalid, /Portkey refused|saved/);
+  assert.match(invalid, /HTTP 400/);
+  // A guardrail: one that refuses DO NOT TRACK is told to turn logging on.
+  const debug = await refused(446, { error: { message: "Header Check failed: x-portkey-debug matched false" } });
+  assert.match(debug, /^A Portkey guardrail denied the request \(HTTP 446\)/);
+  assert.match(debug, /turn the log switch on/);
+  const other = await refused(446, { error: { message: "PII detected" } });
+  assert.match(other, /organization's policy/);
+  assert.doesNotMatch(other, /log switch/);
 });
 
 test("a timeout is reported as one, not as a user abort", async () => {
@@ -509,6 +623,13 @@ test("a refused model list keeps the catalog and says why", async () => {
   // An empty or unreadable list is not a refusal, but still leaves a trace.
   assert.match(await refused(new Response(JSON.stringify({ data: [] }), { status: 200 })), /gateway listed no models|Portkey answered HTTP 200/);
   assert.match(await refused(new Response("<html>502</html>", { status: 200 })), /HTTP 200/);
+  // The organization's policy refusing the list keeps the catalog too, and
+  // does not claim chat is fine: the same policy refuses chat.
+  const policy = await refused(new Response(JSON.stringify({ status: "failure", error: { code: "inline_provider_blocked", message: "Inline provider names are not allowed when saved-only mode is enabled.", field: "x-portkey-provider" } }), { status: 400 }));
+  assert.match(policy, /inline_provider_blocked/);
+  assert.match(policy, /built-in catalog stays/);
+  assert.doesNotMatch(policy, /Chat is unaffected/);
+  assert.match(await refused(new Response(JSON.stringify({ error: { message: "x-portkey-debug matched" } }), { status: 446 })), /log switch/);
 });
 
 test("the config lives in magpie's folder; the old file beside index.ts is read until it exists", () => {
@@ -652,28 +773,68 @@ test("the options magpie's editor opens on are the defaults the code falls back 
   assert.deepEqual(magpie.options, DEFAULT_SWITCHES);
 });
 
-test("the registered provider carries the switches magpie saved under the package's own name", async () => {
-  // magpie's Plugins page files a plugin's options under its package name, so
-  // the name the plugin looks itself up by has to be package.json's. A
-  // mismatch would go unnoticed: nothing is wrong, the switches just never
-  // apply. So the entry is written under the real name and the request is
-  // asked what it carried.
+test("the registered provider carries the switches magpie saved, under the spec magpie saved them as", async () => {
+  // magpie's Plugins page files a plugin's options under the spec it was
+  // added as, and that is the package name with its version or tag:
+  // "@jack-yang/magpie-portkey-bedrock@latest", as a real plugins.json has
+  // it. Matched as a whole string the entry was never found, and every
+  // switch saved there was ignored without a word (2.6.0, 2.6.1). So each
+  // form a spec takes is written here, as magpie writes it (a spec and its
+  // options, nothing more), and the request is asked what it carried.
   const name = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).name as string;
-  writeFileSync(MAGPIE_PLUGINS_PATH(), JSON.stringify({ plugins: [{ spec: name, target: root, options: { log: true, retry: 2 } }] }));
-  try {
-    let registered: any;
-    plugin({ registerProvider: (_id: string, options: unknown) => { registered = options; } } as any);
-    const seen = new Headers();
-    const stream = registered.streamSimple(model, normalizeContext(context), {
-      apiKey: "k", headers: accountGateway,
-      fetch: async (_url: any, init: any) => { for (const [k, v] of new Headers(init?.headers)) seen.append(k, v); return wireResponse(textEvents()); },
-    });
-    assert.equal((await stream.result()).stopReason, "stop");
-    assert.equal(seen.get("x-portkey-debug"), null);
-    assert.deepEqual(JSON.parse(seen.get("x-portkey-config")!), { retry: { attempts: 2, use_retry_after_headers: true } });
-  } finally {
-    rmSync(MAGPIE_PLUGINS_PATH(), { force: true });
+  for (const spec of [name, `${name}@latest`, `${name}@2.6.1`, `${name}@^2`]) {
+    writeFileSync(MAGPIE_PLUGINS_PATH(), JSON.stringify({ plugins: [
+      { spec: "@someone/other-plugin@latest", options: { log: false } },
+      { spec, options: { log: true } },
+    ] }));
+    try {
+      let registered: any;
+      plugin({ registerProvider: (_id: string, options: unknown) => { registered = options; } } as any);
+      const seen = new Headers();
+      const stream = registered.streamSimple(model, normalizeContext(context), {
+        apiKey: "k", headers: accountGateway,
+        fetch: async (_url: any, init: any) => { for (const [k, v] of new Headers(init?.headers)) seen.append(k, v); return wireResponse(textEvents()); },
+      });
+      assert.equal((await stream.result()).stopReason, "stop");
+      // log on, as saved: no DO NOT TRACK header.
+      assert.equal(seen.get("x-portkey-debug"), null, `spec ${spec}`);
+    } finally {
+      rmSync(MAGPIE_PLUGINS_PATH(), { force: true });
+    }
   }
+});
+
+test("this plugin's entry is found however magpie added it: npm, git or a folder", () => {
+  // magpie stores a plugin by the spec it was added as, and nothing else
+  // (plugins.json's Entry: spec, off, options). The three kinds are told
+  // apart as magpie tells them (plugin.IsPath, plugin.IsGit, plugin.Name).
+  const dir = mkdtempSync(join(tmpdir(), "portkey-specs-"));
+  const plugins = join(dir, "plugins.json");
+  const name = "@jack-yang/magpie-portkey-bedrock";
+  const found = (spec: string) => {
+    writeFileSync(plugins, JSON.stringify({ plugins: [{ spec, options: { cacheTtl1h: true } }] }));
+    return readMagpieOptions(plugins, name, () => {}, root).cacheTtl1h === true;
+  };
+  try {
+    // A folder: by its path, as given or as a file:// URL.
+    assert.ok(found(root));
+    assert.ok(found(`file://${root}`));
+    assert.ok(!found(join(tmpdir(), "some-other-checkout")));
+    // A git repository: by the package bun installed it as, which bun keeps
+    // beside the spec in the plugins folder's package.json.
+    mkdirSync(join(dir, "plugins"));
+    writeFileSync(join(dir, "plugins", "package.json"), JSON.stringify({ dependencies: {
+      [name]: "github:yangwudong/magpie-portkey-bedrock#v2.6.2",
+      "@other/thing": "github:other/thing",
+    } }));
+    assert.ok(found("github:yangwudong/magpie-portkey-bedrock#v2.6.2"));
+    assert.ok(!found("github:other/thing"));
+    assert.ok(!found("github:yangwudong/not-installed"));
+    // npm: by the package, whatever the version or tag; another package's
+    // entry is not this one's, however close its name.
+    assert.ok(found(`${name}@latest`));
+    assert.ok(!found(`${name}-fork@latest`));
+  } finally { rmSync(dir, { recursive: true }); }
 });
 
 test("registered refreshModels lists models through the gateway", async () => {
@@ -728,7 +889,8 @@ test("account form credentials decode and the login form asks its three fields",
   });
   assert.deepEqual(first.asked, [
     { message: "Portkey gateway base URL", placeholder: "https://api.portkey.ai/v1" },
-    { message: "Portkey provider slug (x-portkey-provider)", placeholder: "aws-bedrock" },
+    // The slug's hint is the form a Model Catalog slug takes, not a value.
+    { message: "Portkey provider slug (x-portkey-provider)", placeholder: "@your-bedrock-provider" },
     { message: "Portkey API key", placeholder: "pk-…" },
     // The optional name's hint is the name an empty answer gives.
     { message: "Account name (optional, leave empty to use part of the key)", placeholder: "API key pk-f…rm-a" },
@@ -746,19 +908,23 @@ test("account form credentials decode and the login form asks its three fields",
   // A second sign-in right after asks again and saves its own answers:
   // nothing of the first account carries over.
   const second = await signIn({
+    "Portkey provider slug (x-portkey-provider)": "@aws-other",
     "Portkey API key": "pk-form-b",
     "Account name (optional, leave empty to use part of the key)": "  Team B  ",
   });
   assert.equal(second.asked.length, 4);
   assert.equal(second.credentials.accountId, "Team B");
   assert.equal(registered.oauth.getApiKey(second.credentials), "pk-form-b");
-  // Empty answers mean the placeholders' public defaults.
+  // An empty base URL means Portkey's public gateway.
   assert.equal(second.credentials.env.PORTKEY_BASE_URL, "https://api.portkey.ai/v1");
-  assert.equal(second.credentials.env.PORTKEY_PROVIDER, "aws-bedrock");
+  assert.equal(second.credentials.env.PORTKEY_PROVIDER, "@aws-other");
 
-  // A missing key or a base URL that isn't one fails the sign-in.
-  await assert.rejects(() => signIn({}), /API key is required/);
-  await assert.rejects(() => signIn({ "Portkey gateway base URL": "gw.example", "Portkey API key": "pk" }), /http/);
+  // A missing key, a missing slug, or a base URL that isn't one fails the
+  // sign-in. The slug has no default: the one there was (aws-bedrock) named
+  // no Portkey provider.
+  await assert.rejects(() => signIn({ "Portkey provider slug (x-portkey-provider)": "@p" }), /API key is required/);
+  await assert.rejects(() => signIn({ "Portkey API key": "pk" }), /provider slug is required.*@your-bedrock-provider/);
+  await assert.rejects(() => signIn({ "Portkey gateway base URL": "gw.example", "Portkey provider slug (x-portkey-provider)": "@p", "Portkey API key": "pk" }), /http/);
 });
 
 test("per-account headers route the request and the base-URL courier is stripped", async () => {
@@ -882,15 +1048,11 @@ test("the switches reach the gateway as headers, and a header set by hand wins",
   assert.equal((await capture({}, { log: true })).get("x-portkey-debug"), null);
   assert.equal((await capture({ "x-portkey-debug": "true" })).get("x-portkey-debug"), "true");
   assert.equal((await capture({ "X-Portkey-Debug": "false" }, { log: true })).get("x-portkey-debug"), "false");
-  // retry: two by default, so a failure is tried again on the same account
-  // before magpie moves to another and loses its cache; on, the gateway
-  // retries the upstream itself and waits as the provider's Retry-After
-  // asks. 0 turns it off.
-  assert.deepEqual(JSON.parse((await capture({})).get("x-portkey-config")!), { retry: { attempts: 2, use_retry_after_headers: true } });
-  assert.deepEqual(JSON.parse((await capture({}, { retry: 3 })).get("x-portkey-config")!), { retry: { attempts: 3, use_retry_after_headers: true } });
-  assert.equal((await capture({}, { retry: 0 })).get("x-portkey-config"), null);
-  // A saved config id owns the header: the switch gives way rather than
-  // replace the config, and whatever else it holds, with a retry alone.
+  // retry never reaches the gateway as a config, whatever its value: a
+  // Portkey organization blocking inline configs would refuse the request,
+  // and an inline config would replace a default config on the API key.
+  for (const retry of [0, 2, 5]) assert.equal((await capture({}, { retry })).get("x-portkey-config"), null, `retry ${retry}`);
+  // A config the user sets is sent as they set it, and nothing is added.
   assert.equal((await capture({ "x-portkey-config": "pc-saved" }, { retry: 3 })).get("x-portkey-config"), "pc-saved");
   assert.equal((await capture({ "X-Portkey-Config": '{"cache":{"mode":"simple"}}' }, { retry: 3 })).get("x-portkey-config"), '{"cache":{"mode":"simple"}}');
 });
@@ -923,7 +1085,7 @@ test("magpie's plugin options sit over the config file, which sits over the defa
     const load = (logged: string[] = []) =>
       loadConfig(configPath, MODELS, (m) => logged.push(m), readMagpieOptions(plugins, name, (m) => logged.push(m)));
     const writeOptions = (options: unknown, spec: unknown = name) =>
-      writeFileSync(plugins, JSON.stringify({ plugins: [{ spec, target: root, options }] }));
+      writeFileSync(plugins, JSON.stringify({ plugins: [{ spec, options }] }));
 
     // No file, as in plain pi: the config file alone, and it has nothing.
     writeFileSync(configPath, "{}");

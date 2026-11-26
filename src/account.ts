@@ -80,8 +80,13 @@ export function resolveTemplateHeaders(headers: Record<string, string>, env: Rec
 // last answer saves the account. Three fields route the account; the fourth,
 // an optional name, only labels it in magpie's lists (empty: part of the key).
 //
-// Placeholders are always Portkey's public defaults, never another account's
-// values. An empty answer means the default the placeholder shows.
+// Placeholders never show another account's values. The base URL's is
+// Portkey's public gateway, and an empty answer means it. The provider slug
+// has no default: it names a provider in the user's own Model Catalog, so
+// its placeholder is the form one takes (@your-bedrock-provider) and an
+// answer is required. Before 2.6.2 an empty answer meant "aws-bedrock",
+// which no Portkey provider is called (Bedrock's name is "bedrock"), and
+// which a Portkey organization blocking inline providers refuses besides.
 //
 // magpie's bridge restarts a login that has already finished when the front
 // end asks the method again, and the front end does ask again right after the
@@ -95,16 +100,19 @@ export function resolveTemplateHeaders(headers: Record<string, string>, env: Rec
 // kept between sign-ins.
 const FINISH_HOLD_MS = 1_000;
 const DEFAULT_BASE_URL = "https://api.portkey.ai/v1";
-const DEFAULT_PROVIDER = "aws-bedrock";
+const PROVIDER_EXAMPLE = "@your-bedrock-provider";
 
 export async function portkeyLoginForm(callbacks: OAuthLoginCallbacks): Promise<PortkeyAccountForm> {
   const ask = async (message: string, placeholder: string) =>
     (await callbacks.onPrompt({ message, placeholder })).trim();
 
   const baseUrl = (await ask("Portkey gateway base URL", DEFAULT_BASE_URL)) || DEFAULT_BASE_URL;
-  const provider = (await ask("Portkey provider slug (x-portkey-provider)", DEFAULT_PROVIDER)) || DEFAULT_PROVIDER;
+  const provider = await ask("Portkey provider slug (x-portkey-provider)", PROVIDER_EXAMPLE);
   const apiKey = await ask("Portkey API key", "pk-…");
   if (!apiKey) throw new Error("A Portkey API key is required");
+  if (!provider) {
+    throw new Error("A provider slug is required: your Bedrock provider's slug in Portkey's Model Catalog, written @your-bedrock-provider");
+  }
   if (!/^https?:\/\/\S+$/i.test(baseUrl)) throw new Error(`The base URL must start with http:// or https://, not ${baseUrl}`);
   const derived = keyName(apiKey);
   const name = (await ask("Account name (optional, leave empty to use part of the key)", derived)) || derived;

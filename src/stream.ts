@@ -50,19 +50,70 @@ function providerHeaders(
 // header is named "debug", but false only drops the request and response
 // bodies; tokens, cost and latency are kept.
 //
-// Retries are the gateway's (Portkey retries the upstream on 429/5xx with
-// backoff, and waits as the provider's Retry-After asks when told to). They
-// go in x-portkey-config as an inline config, which is the one header a
-// saved config id also uses: with a configId set, the switch is left to that
-// config, as replacing it would drop whatever else the saved one holds.
-function switchHeaders(switches: Pick<PortkeyConfig, "log" | "retry">, configured: Record<string, string>): Record<string, string> {
+// Retries are not among them: they are this provider's own (sendWithRetries).
+// Asking the gateway to retry takes an inline x-portkey-config, which a
+// Portkey organization blocking inline configs refuses outright (400
+// inline_config_blocked, the default for organizations made since June
+// 2026), and which replaces a default config an admin set on the API key.
+function switchHeaders(switches: Pick<PortkeyConfig, "log">, configured: Record<string, string>): Record<string, string> {
   const has = (name: string) => Object.keys(configured).some((key) => key.toLowerCase() === name);
-  return {
-    ...(!switches.log && !has("x-portkey-debug") ? { "x-portkey-debug": "false" } : {}),
-    ...(switches.retry > 0 && !has("x-portkey-config")
-      ? { "x-portkey-config": JSON.stringify({ retry: { attempts: switches.retry, use_retry_after_headers: true } }) }
-      : {}),
-  };
+  return !switches.log && !has("x-portkey-debug") ? { "x-portkey-debug": "false" } : {};
+}
+
+// A failure worth sending again as it was: rate limited (429), timed out
+// (408) or the upstream failing (5xx). Anything else says the request
+// itself is refused, and the same request would be refused again.
+function retryable(status: number): boolean {
+  return status === 429 || status === 408 || status >= 500;
+}
+
+// How long to wait before the next try: what the reply asks for when it
+// says, else 1s doubled each time (1s, 2s, 4s…). null when the wait it asks
+// for is a minute or more, or would take the waiting past a minute in all:
+// the account is not coming back soon, and magpie should hear of it now.
+const RETRY_WAIT_CAP_MS = 60_000;
+function retryWait(response: Response, attempt: number, waited: number): number | null {
+  const ms = response.headers.get("retry-after-ms");
+  const after = response.headers.get("retry-after");
+  let asked: number | undefined;
+  if (ms && !Number.isNaN(Number(ms))) asked = Number(ms);
+  else if (after) {
+    const seconds = Number(after);
+    asked = Number.isNaN(seconds) ? Date.parse(after) - Date.now() : seconds * 1000;
+    if (Number.isNaN(asked)) asked = undefined;
+  }
+  const wait = asked !== undefined ? Math.max(0, asked) : 1000 * 2 ** attempt;
+  if (wait >= RETRY_WAIT_CAP_MS || waited + wait > RETRY_WAIT_CAP_MS) return null;
+  return wait;
+}
+
+// Sends a request, and sends it again on the same account while it fails
+// in a way that may pass (retryable), up to `retries` more times. The same
+// account, so the prompt cache written there is read again: magpie moving
+// to another account starts with no cache. The last reply is what is
+// returned, success or not, so magpie still sees the final status and its
+// Retry-After when every try failed. An abort stops the waiting at once.
+async function sendWithRetries(
+  send: () => Promise<Response>,
+  retries: number,
+  signal: AbortSignal | undefined,
+): Promise<Response> {
+  let waited = 0;
+  for (let attempt = 0; ; attempt++) {
+    const response = await send();
+    if (response.ok || attempt >= retries || !retryable(response.status)) return response;
+    const wait = retryWait(response, attempt, waited);
+    if (wait === null) return response;
+    // The failed reply is let go before waiting; its body is not read.
+    await response.body?.cancel().catch(() => {});
+    waited += wait;
+    await new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) return reject(signal.reason);
+      const timer = setTimeout(() => { signal?.removeEventListener("abort", stop); resolve(); }, wait);
+      const stop = () => { clearTimeout(timer); reject(signal!.reason); };
+      signal?.addEventListener("abort", stop, { once: true });
+    });
+  }
 }
 
 // Header lookup that tolerates case differences between the layer that set
@@ -244,7 +295,9 @@ function streamPortkeyAws(
             const replacement = await options.onPayload(payload, model);
             init = { ...init, body: JSON.stringify(replacement ?? payload) };
           }
-          const response = await send(url, init);
+          // The body is a string, so it can be sent again as it is.
+          const retries = typeof init?.body === "string" || init?.body == null ? switches.retry : 0;
+          const response = await sendWithRetries(() => send(url, init), retries, signal);
           traceId = response.headers.get("x-portkey-trace-id") ?? undefined;
           // A refusal is the gateway's own: read its body once here, since
           // the SDK only keeps the text of an error it recognises.

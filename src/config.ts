@@ -1,7 +1,7 @@
 // The optional shared config and the bundled model catalog.
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { BASE_URL_ENV, BASE_URL_HEADER, PROVIDER_ENV } from "./account.ts";
@@ -47,8 +47,8 @@ export interface PortkeyConfig {
   /** Whether Portkey may store request and response content in its logs. Off by default. */
   log: boolean;
   /**
-   * Gateway-side retries: how many more times Portkey asks the same account
-   * when Bedrock answers 429 or a 5xx. 0 for none.
+   * Retries on the same account: how many more times this provider sends a
+   * request that failed with 429, 408 or a 5xx, before magpie hears of it. 0 for none.
    */
   retry: number;
   /** Ask Bedrock's one-hour prompt-cache TTL on Claude models that support it, instead of the 5-minute default. */
@@ -69,16 +69,19 @@ type SomeSwitches = Partial<Switches>;
 
 // What a switch is when nothing sets it, in this file or magpie's options.
 //
-// retry is 2: a failure is retried on the same account twice before magpie
-// hears of it. That keeps the account's prompt cache, which is lost the
-// moment magpie moves to another account, and it absorbs a brief 429 without
-// one. It costs up to 3 seconds of waiting on a request that keeps failing
-// (Portkey backs off 1s, then 2s: 1s doubled per retry, as its docs table
-// says), and less when Bedrock says how long to wait: Portkey follows
-// Bedrock's Retry-After, and gives up at once when told to wait 60s or more,
-// so an account that is down for long reaches magpie fast. 3 would add 4
-// more seconds for a third try that rarely helps; 0 would lose the cache to
-// magpie's failover on every blip. docs/portkey-reference.md has the sums.
+// retry is 2: a failure is sent again on the same account twice before
+// magpie hears of it. That keeps the account's prompt cache, which is lost
+// the moment magpie moves to another account, and it absorbs a brief 429
+// without one. This provider sends the retries itself (sendWithRetries in
+// stream.ts), not Portkey's gateway: asking the gateway takes an inline
+// x-portkey-config, which an organization blocking inline configs refuses
+// and which replaces a default config set on the API key. It costs up to 3
+// seconds of waiting on a request that keeps failing (1s, then 2s), and
+// less when Bedrock says how long to wait; told to wait a minute or more, it
+// stops at once, so an account that is down for long reaches magpie fast. 3
+// would add 4 more seconds for a third try that rarely helps; 0 would lose
+// the cache to magpie's failover on every blip. docs/portkey-reference.md
+// has the sums.
 //
 // log is off: nothing of what is said belongs in Portkey's logs unless
 // asked for. cacheTtl1h is off: an hour's cache is said to cost more to
@@ -263,19 +266,67 @@ export function MAGPIE_PLUGINS_PATH(home: string = homedir()): string {
   return process.env.PORTKEY_BEDROCK_PLUGINS || join(home, ".config", "magpie", "plugins.json");
 }
 
-// This plugin's entry in magpie's plugins.json, by its own name; its
-// switches, checked as the config file's are. A file that cannot be read is
-// no override: it is magpie's, not this plugin's to fail on.
+// The package a plugins.json spec names, as magpie reads it (plugin.Name in
+// its store.go): "@scope/x" of "@scope/x", "@scope/x@latest" or
+// "@scope/x@2.6.1". magpie saves the spec as it was added, so the version
+// is often there; comparing whole strings missed every such entry.
+function specPackage(spec: string): string {
+  const at = spec.lastIndexOf("@");
+  return at > 0 ? spec.slice(0, at) : spec;
+}
+
+// A spec of a folder, as magpie tells one (plugin.IsPath): file://, ./, /,
+// \ or a drive letter.
+function specIsPath(spec: string): boolean {
+  return /^(file:\/\/|\.|\/|\\|[A-Za-z]:[\\/])/.test(spec);
+}
+
+// A spec of a git repository, as magpie tells one (plugin.IsGit):
+// github:owner/repo[#ref] and its kin, a git+…:// or git:// URL, a GitHub,
+// GitLab or Bitbucket page, or owner/repo.
+function specIsGit(spec: string): boolean {
+  return !specIsPath(spec) && /^(?:(?:github|gitlab|bitbucket):|git\+[a-z]+:\/\/|git:\/\/)\S+$|^https?:\/\/(?:www\.)?(?:github\.com|gitlab\.com|bitbucket\.org)\/\S+$|^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9_.-]+(?:#\S+)?$/.test(spec);
+}
+
+// The package a git spec was installed as: bun keeps the spec as given in
+// the plugins folder's package.json, beside the name it installed (magpie's
+// plugin.gitName). undefined when it is not there.
+function gitPackage(spec: string, pluginsDir: string): string | undefined {
+  try {
+    const deps = (JSON.parse(readFileSync(join(pluginsDir, "package.json"), "utf8")) as { dependencies?: Record<string, unknown> }).dependencies ?? {};
+    return Object.entries(deps).find(([, given]) => given === spec)?.[0];
+  } catch {
+    return undefined;
+  }
+}
+
+// Whether a plugins.json spec is this plugin's: by its package name for an
+// npm or git spec, by the folder for a path. magpie stores the spec alone
+// (Entry: spec, off, options); where it loads from is worked out from it.
+function specIsMine(spec: string, name: string, folder: string, pluginsDir: string): boolean {
+  if (specIsPath(spec)) return resolve(spec.replace(/^file:\/\//, "")) === resolve(folder);
+  if (specIsGit(spec)) return gitPackage(spec, pluginsDir) === name;
+  return specPackage(spec) === name;
+}
+
+// This plugin's entry in magpie's plugins.json: the one whose spec is this
+// package, at whatever version, from npm or a git repository, or this very
+// folder (a local checkout is added by its path). Its switches are checked
+// as the config file's are. A file that cannot be read is no override: it
+// is magpie's, not this plugin's to fail on.
 export function readMagpieOptions(
   pluginsPath = MAGPIE_PLUGINS_PATH(),
   name: string,
   log: (message: string) => void = console.error,
+  folder: string = PACKAGE_DIR,
 ): SomeSwitches {
   if (!existsSync(pluginsPath)) return {};
   try {
     const list = readJsonFile(pluginsPath) as { plugins?: Array<{ spec?: unknown; options?: unknown }> } | null;
+    // The folder magpie installs packages into, beside plugins.json.
+    const pluginsDir = join(dirname(pluginsPath), "plugins");
     const entry = Array.isArray(list?.plugins)
-      ? list.plugins.find((plugin) => plugin?.spec === name)
+      ? list.plugins.find((plugin) => typeof plugin?.spec === "string" && specIsMine(plugin.spec, name, folder, pluginsDir))
       : undefined;
     const options = entry?.options;
     if (!options || typeof options !== "object" || Array.isArray(options)) return {};

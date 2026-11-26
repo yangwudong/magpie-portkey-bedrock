@@ -51,9 +51,20 @@ export function finishErrorMessage(reason: FinishReason | undefined, raw: string
 // reason ("Portkey Error: Forbidden!. Error Code: 033"); AWS's name the IAM
 // action they denied and the account that was denied it. The account is left
 // out on purpose: an error message gets copied into chats and screenshots.
+//
+// Two more are an organization's policy rather than a fault:
+// - "blocked": its Block Inline Configs setting (on by default for
+//   organizations made since June 2026) refuses a request that names a
+//   provider, config, host or forwarded headers inline, with a 400 whose
+//   error.code says which (inline_provider_blocked, inline_config_blocked…).
+// - "guardrail": a 446, a guardrail that denied the request. One kind is a
+//   start hook refusing x-portkey-debug false, to keep clients from turning
+//   off request logging.
 export type GatewayRefusal =
   | { kind: "aws"; action: string }
   | { kind: "portkey"; status: number; quoted: string }
+  | { kind: "blocked"; code: string; quoted: string }
+  | { kind: "guardrail"; debug: boolean; quoted: string }
   | { kind: "unknown"; status: number; quoted: string };
 
 export function readGatewayRefusal(status: number, body: unknown): GatewayRefusal {
@@ -65,13 +76,38 @@ export function readGatewayRefusal(status: number, body: unknown): GatewayRefusa
   if (typeof body === "string") {
     try { object = JSON.parse(body); } catch { object = undefined; }
   }
-  const error = typeof object === "object" && object !== null ? (object as { error?: { message?: unknown } }).error : undefined;
+  const error = typeof object === "object" && object !== null ? (object as { error?: { message?: unknown; code?: unknown } }).error : undefined;
   const said = typeof error?.message === "string" ? error.message : text;
-  const quoted = said.replace(/\s+/g, " ").trim().slice(0, 300);
+  const quoted = said.replace(/\s+/g, " ").trim().slice(0, 300).replace(/[.。]+$/, "");
   const iam = /is not authorized to perform:?\s*([a-zA-Z0-9:*_-]+)/.exec(text);
   if (iam) return { kind: "aws", action: iam[1] };
+  // Only Portkey's own codes: a Bedrock 400 (a validationException) is the
+  // request's own fault and keeps the SDK's wording.
+  if (status === 400 && typeof error?.code === "string" && /^inline_[a-z_]+_blocked$/.test(error.code)) {
+    return { kind: "blocked", code: error.code, quoted };
+  }
+  if (status === 446) return { kind: "guardrail", debug: /x-portkey-debug/i.test(text), quoted };
   if (status === 401 || status === 403 || status === 412) return { kind: "portkey", status, quoted };
   return { kind: "unknown", status, quoted };
+}
+
+// What to do about a request Block Inline Configs refused, by its code. Each
+// names the setting the user controls here: the request is the plugin's own
+// unless a header or config they set is what Portkey refused.
+function blockedAdvice(code: string): string {
+  switch (code) {
+    case "inline_provider_blocked":
+      return "This organization accepts only saved providers: sign in again with the provider's Model Catalog slug, written @your-provider, in place of a plain name such as bedrock.";
+    case "inline_config_blocked":
+      return "This organization accepts only saved configs: give configId a saved config's id (pc-…) rather than a config object, and take any x-portkey-config out of headers.";
+    case "inline_custom_host_blocked":
+    case "inline_provider_url_blocked":
+      return "This organization accepts only the endpoint set on a saved provider: take the custom host or provider URL out of headers and set it on the provider in Portkey.";
+    case "inline_forward_headers_blocked":
+      return "This organization does not let a request forward headers: take x-portkey-forward-headers out of headers, and have forward_headers set on the saved provider instead.";
+    default:
+      return "This organization accepts only saved resources: reference saved providers and configs by their slug or id.";
+  }
 }
 
 // The refusal as one sentence, without what to do about it: that depends on
@@ -84,9 +120,22 @@ function refusalLine(refusal: GatewayRefusal): string {
       return refusal.status === 412
         ? `Portkey stopped the request: a budget is exhausted (HTTP 412)${quote(refusal.quoted)}`
         : `Portkey refused the request (HTTP ${refusal.status})${quote(refusal.quoted)}`;
+    case "blocked":
+      return `Portkey refused the request: ${refusal.code} (HTTP 400)${quote(refusal.quoted)}`;
+    case "guardrail":
+      return `A Portkey guardrail denied the request (HTTP 446)${quote(refusal.quoted)}`;
     default:
       return `Portkey answered HTTP ${refusal.status}${quote(refusal.quoted)}`;
   }
+}
+
+// A guardrail's denial, the same for any request: one that refuses
+// DO NOT TRACK is fixed by turning logging on, and nothing else is the
+// user's to change. Sending it again is denied again.
+function guardrailAdvice(refusal: { debug: boolean }): string {
+  return refusal.debug
+    ? "Your organization requires request logging: turn the log switch on (magpie's Options for this plugin, or log in its config.json)."
+    : "It is your organization's policy, not a failure: sending it again is denied again. Portkey's logs name the guardrail that fired.";
 }
 
 // A quoted body, with the space before it; none for an empty one.
@@ -102,6 +151,10 @@ function quote(quoted: string): string {
 export function modelListRefusal(status: number, body: unknown): string {
   const refusal = readGatewayRefusal(status, body);
   if (refusal.kind === "unknown") return `${refusalLine(refusal)}. Chat is unaffected; the built-in catalog stays.`;
+  // A policy refusing the list refuses chat as well, so it is not said to be
+  // unaffected; the catalog still stands in for the list.
+  if (refusal.kind === "blocked") return `${refusalLine(refusal)}. The built-in catalog stays. ${blockedAdvice(refusal.code)}`;
+  if (refusal.kind === "guardrail") return `${refusalLine(refusal)}. The built-in catalog stays. ${guardrailAdvice(refusal)}`;
   const advice = refusal.kind === "aws"
     ? `To list the gateway's models, allow ${refusal.action} on the Portkey user, or list the models by hand in config.json.`
     : refusal.kind === "portkey" && refusal.status === 412
@@ -118,6 +171,8 @@ export function modelListRefusal(status: number, body: unknown): string {
 export function requestRefusal(status: number, body: unknown): string | undefined {
   const refusal = readGatewayRefusal(status, body);
   if (refusal.kind === "unknown") return undefined;
+  if (refusal.kind === "blocked") return `${refusalLine(refusal)}. ${blockedAdvice(refusal.code)}`;
+  if (refusal.kind === "guardrail") return `${refusalLine(refusal)}. ${guardrailAdvice(refusal)}`;
   const advice = refusal.kind === "aws"
     ? `Allow ${refusal.action} on the AWS principal behind this Portkey route.`
     : refusal.kind === "portkey" && refusal.status === 412

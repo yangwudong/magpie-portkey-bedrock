@@ -17,6 +17,9 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
   const temp = mkdtempSync(join(tmpdir(), "magpie-portkey-host-"));
   let events = textEvents();
   let status = 200;
+  // How long a refusal asks to be waited for. Short here, as the plugin now
+  // waits for it on the same account before magpie hears of the failure.
+  let retryAfter = "0";
   const requests: Array<{ headers: any; body: any }> = [];
   const upstream = createServer(async (req, res) => {
     const chunks = [];
@@ -30,7 +33,7 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
     }
     requests.push({ headers: req.headers, body: JSON.parse(raw) });
     if (status !== 200) {
-      res.writeHead(status, { "content-type": "application/json", "retry-after": "7" });
+      res.writeHead(status, { "content-type": "application/json", "retry-after": retryAfter });
       res.end(JSON.stringify({ type: "throttlingException", message: "Slow down" }));
     } else {
       res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
@@ -205,11 +208,27 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
     assert.equal(requests.at(-1)!.headers["x-portkey-api-key"], "second-test-key");
     assert.equal(requests.at(-1)!.headers["x-portkey-provider"], "@aws-second");
 
+    // A refusal that keeps coming: tried again on the same account (twice by
+    // default), and magpie is then handed the last 429 and its Retry-After,
+    // so its own failover still works. Chat requests are counted; a model
+    // list can be asked for in between.
+    const chats = (from: number) => requests.slice(from).filter((r) => r.body !== null).length;
     status = 429;
+    const before = requests.length;
     const failure = await ask();
     assert.equal(failure.head.status, 429, failure.data);
-    assert.equal(failure.head.headers["retry-after"], "7");
+    assert.equal(failure.head.headers["retry-after"], "0");
     assert.match(failure.data, /Slow down/);
+    assert.equal(chats(before), 3, "first try and two retries");
+    // A wait of a minute or more is not waited: magpie hears of it at once,
+    // and can move to another account.
+    retryAfter = "120";
+    const long = requests.length;
+    const refused = await ask();
+    assert.equal(refused.head.status, 429, refused.data);
+    assert.equal(refused.head.headers["retry-after"], "120");
+    assert.equal(chats(long), 1, "no wait of two minutes");
+    retryAfter = "0";
     const auth = JSON.parse(readFileSync(join(temp, "auth.json"), "utf8"));
     // The form's sign-ins are stored as oauth credentials carrying the key
     // and the account's routing env, one entry per account.
@@ -239,46 +258,63 @@ test("Magpie's actual Bun host: discovery, account keys, Anthropic SSE/JSON, thi
 
     // magpie's plugin options, as its Plugins page's Options editor saves
     // them: in plugins.json, and then the host restarted. A pi extension is
-    // handed nothing of them, so it reads the file itself as it starts. The
-    // switches are to show on the request as headers.
+    // handed nothing of them, so it reads the file itself as it starts.
+    // magpie keeps the spec as the plugin was added, version and all: a
+    // real plugins.json has "@jack-yang/magpie-portkey-bedrock@latest", and
+    // 2.6.0 and 2.6.1 never found an entry written so.
     const writeOptions = (options: Record<string, unknown>) =>
-      writeFileSync(pluginsPath, JSON.stringify({ plugins: [{ spec: "@jack-yang/magpie-portkey-bedrock", target: root, options }] }));
+      writeFileSync(pluginsPath, JSON.stringify({ plugins: [{ spec: "@jack-yang/magpie-portkey-bedrock@latest", options }] }));
     const start = async () => {
       host.stop();
       Object.assign(host, startHost());
       const loaded = await rpc("init", { directory: temp, authPath: join(temp, "auth.json"), piPath: join(source!, "internal/plugin/pi.js"), plugins: [{ spec: root, target: root }] });
       assert.equal(loaded.result.plugins[0].error, undefined, loaded.result.plugins[0].error ?? stderr());
     };
-    const lastHeaders = () => requests.at(-1)!.headers;
+    // The headers of the last chat request: a restarted host lists the
+    // models again, and that GET may come last.
+    const lastHeaders = () => requests.filter((r) => r.body !== null).at(-1)!.headers;
+    // Tries a request that keeps failing, and counts how often it was sent.
+    // Chat requests only: a restarted host lists the models again, and that
+    // GET can land in between.
+    const tries = async () => {
+      status = 503;
+      const before = requests.length;
+      await ask();
+      status = 200;
+      return requests.slice(before).filter((r) => r.body !== null).length;
+    };
     status = 200;
     events = textEvents();
     // As the plugin ships, with nothing saved: no content in Portkey's logs,
-    // and two gateway retries on the same account before magpie hears of a
-    // failure.
+    // two retries on the same account, and never a config for the gateway
+    // (one would be refused where inline configs are blocked).
     writeOptions({});
     await start();
     await ask();
     assert.equal(lastHeaders()["x-portkey-debug"], "false");
-    assert.deepEqual(JSON.parse(lastHeaders()["x-portkey-config"]), { retry: { attempts: 2, use_retry_after_headers: true } });
-    // Each switch on shows on the request made after the restart.
+    assert.equal(lastHeaders()["x-portkey-config"], undefined);
+    assert.equal(await tries(), 3);
+    // Each switch saved shows on the request made after the restart: these
+    // are the switches as magpie stores them, found under a spec with its
+    // version on.
     writeOptions({ log: true, retry: 3, cacheTtl1h: true });
     await start();
     const on = await ask();
     assert.equal(on.head.status, 200, on.data);
     assert.equal(lastHeaders()["x-portkey-debug"], undefined);
-    assert.deepEqual(JSON.parse(lastHeaders()["x-portkey-config"]), { retry: { attempts: 3, use_retry_after_headers: true } });
-    assert.deepEqual(requests.at(-1)!.body.system.at(-1), { cachePoint: { type: "default", ttl: "1h" } });
-    // Retry can be turned off for good, and then no retry config is sent.
+    assert.equal(lastHeaders()["x-portkey-config"], undefined);
+    assert.deepEqual(requests.filter((r) => r.body !== null).at(-1)!.body.system.at(-1), { cachePoint: { type: "default", ttl: "1h" } });
+    assert.equal(await tries(), 4);
+    // Retry 0: one try, the failure to magpie at once.
     writeOptions({ retry: 0 });
     await start();
-    await ask();
-    assert.equal(lastHeaders()["x-portkey-config"], undefined);
-    // Back off again: a restart with the switches gone returns to the defaults.
+    assert.equal(await tries(), 1);
+    // Back again: a restart with a switch gone returns it to its default.
     writeOptions({ retry: 1 });
     await start();
     await ask();
     assert.equal(lastHeaders()["x-portkey-debug"], "false");
-    assert.deepEqual(JSON.parse(lastHeaders()["x-portkey-config"]), { retry: { attempts: 1, use_retry_after_headers: true } });
+    assert.equal(await tries(), 2);
     // A switch magpie saved that this plugin does not know is refused, and
     // the reason reaches magpie's log: a mistyped one must not pass silently.
     writeOptions({ logs: false });

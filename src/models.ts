@@ -2,7 +2,7 @@
 import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { accountFormOf, BASE_URL_ENV, BASE_URL_HEADER, PROVIDER_ENV, resolveTemplateHeaders } from "./account.ts";
 import type { ModelConfig, PortkeyConfig } from "./config.ts";
-import { modelListRefusal } from "./errors.ts";
+import { modelListRefusal, readGatewayRefusal } from "./errors.ts";
 
 // The minimal shape of pi's RefreshModelsContext this extension uses. Kept
 // structural so it stays assignable to the real contract.
@@ -105,9 +105,15 @@ export async function discoverGatewayModels(
     // to the log, so a key that cannot list models does not look like a
     // gateway that simply has no models.
     if (res.status === 404) return catalog();
-    if (res.status === 403) {
-      log(`portkey-bedrock: ${modelListRefusal(403, await res.text())}`);
-      return catalog();
+    // A refusal by the key, the organization's policy or a guardrail keeps
+    // the catalog and says why. The policy ones name a setting to change.
+    if (res.status === 403 || res.status === 400 || res.status === 446) {
+      const text = await res.text();
+      const refusal = readGatewayRefusal(res.status, text);
+      if (res.status === 403 || refusal.kind === "blocked" || refusal.kind === "guardrail") {
+        log(`portkey-bedrock: ${modelListRefusal(res.status, text)}`);
+        return catalog();
+      }
     }
     throw new Error(`portkey-bedrock: GET ${base}/models answered ${res.status}`);
   }
